@@ -58,4 +58,4 @@ jobs:
         run: |
           gh release create $env:VERSION Haylou-S40-Windows.zip `
             --title "Haylou S40 para Windows $env:VERSION" `
-            --notes "Descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No hace falta instalar Python. Windows puede mostrar un aviso de SmartScreen porque el programa no está firmado: pulsa «Más información» y «Ejecutar de todas formas'."
+            --notes "Descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No hace falta instalar Python. Windows puede mostrar un aviso de SmartScreen porque el programa no está firmado: pulsa «Más información» y «Ejecutar de todas formas»."
