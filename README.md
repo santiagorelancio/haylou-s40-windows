@@ -15,6 +15,8 @@ Pequeña aplicación de escritorio, en español, para ver el estado y controlar 
 - **Audio espacial**: Dinámico, Estático y Off, con el escenario (Música, Ejercicio, Película).
 - Interruptores para **modo juego**, **reducción de ruido de viento** y **multipunto**.
 - Icono en la bandeja con el porcentaje de batería y el modo activo (clic derecho para cambiar de modo).
+- **Aviso de batería baja** (20 % y 10 %) como notificación de Windows; se activa o desactiva desde el menú de la bandeja.
+- Si abres la app otra vez mientras está en la bandeja, muestra la ventana ya abierta.
 - Tema claro/oscuro según Windows, animaciones suaves (respeta «reducir animaciones»), reconexión automática y opción de iniciar con Windows.
 
 Lo que **no** incluye: el EQ del auricular (los valores no coinciden con ningún nombre conocido), LDAC (Windows no usa ese códec y el cambio reinicia los auriculares) y los niveles de ANC (en las pruebas no produjeron ningún cambio medible). Detalles en [docs/PROTOCOLO-S40.md](docs/PROTOCOLO-S40.md).
@@ -47,6 +49,7 @@ Empaqueta la app con PyInstaller, la instala para tu usuario en `%LOCALAPPDATA%\
 
 - **Solo un dispositivo puede controlar los auriculares a la vez.** Si la app oficial del celular (o una segunda copia de esta app) está conectada, los auriculares esconden sus servicios de control y esta app mostrará que no responden. Cierra la otra app y pulsa «Reconectar». Con el **multipunto** activado el celular puede conectarse a la vez para el audio.
 - La primera conexión puede tardar entre 10 y 20 segundos.
+- Si algo falla, el registro está en `%APPDATA%\HaylouS40\haylou.log`.
 - La app habla con los auriculares por Bluetooth LE mientras siguen conectados como audio normal; no cambia nada del audio de Windows.
 
 ## Cómo funciona
