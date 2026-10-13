@@ -5,6 +5,7 @@ auriculares mientras siguen conectados como audio normal.
 """
 import asyncio
 import ctypes
+import functools
 import json
 import os
 import queue
@@ -86,37 +87,62 @@ SETTABLE = {"anc": P.ATTR_ANC, "game": P.ATTR_GAME, "wind": P.ATTR_WIND,
             "spatial": P.ATTR_SPATIAL, "multi": P.ATTR_MULTI, "scene": P.ATTR_SCENE}
 
 
-class Headset:
-    """Hilo con su propio asyncio loop. El estado se lee desde la UI sin bloquear."""
+# Cadencias de sondeo (s). Con la ventana oculta solo hace falta la batería del
+# icono de bandeja: los cambios hechos con el botón físico llegan solos por notificación.
+POLL_STATE_VISIBLE = 5
+POLL_BATT_VISIBLE = 30
+POLL_BATT_HIDDEN = 120
+RETRY_MIN, RETRY_MAX_HIDDEN, RETRY_MAX_VISIBLE = 8, 60, 15
 
-    def __init__(self):
+
+class Headset:
+    """Hilo con su propio asyncio loop, totalmente dirigido por eventos: duerme hasta
+    el próximo comando, aviso o sondeo programado (sin despertares periódicos)."""
+
+    def __init__(self, on_change=None):
         self.cfg = load_config()
         self.state = {"connected": False, "status": "Buscando auriculares…",
                       "battery": None, "anc": None, "game": None, "wind": None,
                       "spatial": None, "multi": None, "scene": None}
-        self.q: "queue.Queue[tuple]" = queue.Queue()
+        self.on_change = on_change  # se llama desde el hilo BLE; debe ser seguro entre hilos
+        self.loop = asyncio.new_event_loop()
+        self.aq: "asyncio.Queue[tuple]" = asyncio.Queue()
         self.client = None
         self.run = True
-        self.last_rx = 0.0
-        threading.Thread(target=lambda: asyncio.run(self._main()), daemon=True).start()
+        self.active = False  # ventana visible
+        threading.Thread(target=self._thread, daemon=True).start()
+
+    def _thread(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._main())
 
     # --- API para la UI ---
     def send(self, kind, value=None):
-        self.q.put((kind, value))
+        try:
+            self.loop.call_soon_threadsafe(self.aq.put_nowait, (kind, value))
+        except RuntimeError:
+            pass
 
     def stop(self):
         self.run = False
-        self.q.put(("quit", None))
+        self.send("quit")
 
     # --- internos ---
+    def _changed(self):
+        if self.on_change:
+            try:
+                self.on_change()
+            except Exception:
+                pass
+
     def _status(self, text, connected=None):
         self.state["status"] = text
         if connected is not None:
             self.state["connected"] = connected
+        self._changed()
 
     def _on_notify(self, _, data):
         b = bytes(data)
-        self.last_rx = time.time()
         pct = P.parse_battery(b)
         if pct is not None:
             self.state["battery"] = pct
@@ -130,7 +156,11 @@ class Headset:
                     self.state[key] = v
         elif pct is None and P.is_valid(b) and b[4] not in (0x02, 0x08, 0x09):
             # aviso espontáneo (p. ej. botón físico): pedimos el estado completo
-            self.q.put(("refresh", None))
+            self.send("refresh")
+        self._changed()
+
+    def _on_disconnect(self, _client):
+        self.send("lost")
 
     async def _find(self):
         addr = self.cfg.get("addr")
@@ -153,7 +183,8 @@ class Headset:
         client = None
         names = set()
         for fresh in (False, True):  # 2.º intento: sin la caché de servicios de Windows
-            client = BleakClient(dev, timeout=15.0, winrt={"use_cached_services": False} if fresh else {})
+            client = BleakClient(dev, timeout=15.0, disconnected_callback=self._on_disconnect,
+                                 winrt={"use_cached_services": False} if fresh else {})
             await client.connect()
             names = {c.uuid.lower() for s in client.services for c in s.characteristics}
             if P.SVC_WRITE in names:
@@ -194,33 +225,67 @@ class Headset:
         self.client = None
         self.state["connected"] = False
 
+    def _retry_delay(self, fails):
+        cap = RETRY_MAX_VISIBLE if self.active else RETRY_MAX_HIDDEN
+        return min(RETRY_MIN * 1.5 ** max(0, fails - 1), cap)
+
     async def _main(self):
-        loop = asyncio.get_running_loop()
-        last_poll = last_batt = 0.0
-        last_try = 0.0
+        inf = float("inf")
+        fails = 0
+        next_try = 0.0
+        next_batt = next_state = inf
         while self.run:
+            now = time.monotonic()
             if not self._alive():
                 if self.state["connected"]:
                     self._status("Conexión perdida, reconectando…", False)
-                if time.time() - last_try >= 8:
-                    last_try = time.time()
+                if now >= next_try:
                     try:
-                        if await self._connect():
+                        ok = await self._connect()
+                        if ok:
                             await self._refresh()
-                            last_poll = last_batt = time.time()
                     except Exception as e:
+                        ok = False
                         await self._drop()
                         self._status(f"No se pudo conectar ({type(e).__name__}). Reintentando…", False)
+                    now = time.monotonic()
+                    if ok:
+                        fails = 0
+                        next_batt = now + (POLL_BATT_VISIBLE if self.active else POLL_BATT_HIDDEN)
+                        next_state = now + POLL_STATE_VISIBLE if self.active else inf
+                    else:
+                        fails += 1
+                        next_try = now + self._retry_delay(fails)
+                deadline = next_try
+            else:
+                deadline = min(next_batt, next_state)
             try:
-                kind, value = await loop.run_in_executor(None, lambda: self.q.get(timeout=0.5))
-            except queue.Empty:
-                kind = None
+                kind, value = await asyncio.wait_for(self.aq.get(), max(0.0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                kind = value = None
             if kind == "quit":
                 break
+            now = time.monotonic()
             try:
                 if kind == "reconnect":
                     await self._drop()
-                    last_try = 0
+                    fails, next_try = 0, 0.0
+                elif kind == "lost":
+                    if not self._alive():
+                        await self._drop()
+                        self._changed()
+                        next_try = now + 2
+                elif kind == "active":
+                    self.active = bool(value)
+                    if self._alive():
+                        if self.active:  # al abrir: datos frescos ya, y ritmo fluido
+                            await self._refresh()
+                            next_batt, next_state = now + POLL_BATT_VISIBLE, now + POLL_STATE_VISIBLE
+                        else:
+                            next_batt = min(next_batt, now + POLL_BATT_HIDDEN)
+                            next_state = inf
+                    elif self.active:  # reintenta ya al abrir la ventana si pasó un rato
+                        fails, next_try = 0, min(next_try, now + 1)
                 elif self._alive():
                     if kind in SETTABLE:
                         self.state[kind] = int(value)
@@ -228,29 +293,36 @@ class Headset:
                     if kind in SETTABLE or kind == "refresh":
                         await asyncio.sleep(0.9)
                         await self._refresh(battery=False)
-                    now = time.time()
-                    if now - last_poll >= 5:
-                        last_poll = now
-                        await self._refresh(battery=now - last_batt >= 30)
-                        if now - last_batt >= 30:
-                            last_batt = now
+                        if self.active:
+                            next_state = time.monotonic() + POLL_STATE_VISIBLE
+                    elif kind is None:
+                        batt_due = now >= next_batt
+                        await self._refresh(battery=batt_due)
+                        if batt_due:
+                            next_batt = now + (POLL_BATT_VISIBLE if self.active else POLL_BATT_HIDDEN)
+                        next_state = now + POLL_STATE_VISIBLE if self.active else inf
             except Exception:
                 await self._drop()
+                self._changed()
         await self._drop()
 
 
 # ───────────────────────── icono de bandeja ─────────────────────────
+@functools.lru_cache(maxsize=4)
+def _icon_font(size):
+    try:
+        return ImageFont.truetype("arialbd.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
 def make_icon(battery, anc, connected=True) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     color = MODE_COLOR.get(anc, "#8A8F98") if connected else "#4B5058"
     d.ellipse((2, 2, 62, 62), fill=color)
     text = "?" if battery is None or not connected else str(battery)
-    try:
-        font = ImageFont.truetype("arialbd.ttf", 30 if len(text) < 3 else 24)
-    except Exception:
-        font = ImageFont.load_default()
-    d.text((32, 33), text, fill="white", font=font, anchor="mm")
+    d.text((32, 33), text, fill="white", font=_icon_font(30 if len(text) < 3 else 24), anchor="mm")
     return img
 
 
@@ -312,10 +384,29 @@ def system_theme() -> str:
         return "dark"
 
 
+_rm_cache = (0.0, False)
+
+
 def reduce_motion() -> bool:
-    on = ctypes.c_int(1)  # SPI_GETCLIENTAREAANIMATION
-    ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)
-    return not on.value
+    global _rm_cache
+    now = time.monotonic()
+    if now - _rm_cache[0] > 5:  # la consulta al sistema no hace falta en cada fotograma
+        on = ctypes.c_int(1)  # SPI_GETCLIENTAREAANIMATION
+        ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)
+        _rm_cache = (now, not on.value)
+    return _rm_cache[1]
+
+
+def set_eco_mode(on: bool):
+    """Oculta -> prioridad mínima y «modo eficiencia» (EcoQoS) de Windows; visible -> normal."""
+    try:
+        k32 = ctypes.windll.kernel32
+        proc = k32.GetCurrentProcess()
+        k32.SetPriorityClass(proc, 0x40 if on else 0x20)  # IDLE / NORMAL
+        state = (ctypes.c_ulong * 3)(1, 1, 1 if on else 0)  # Version, ControlMask, StateMask
+        k32.SetProcessInformation(proc, 4, ctypes.byref(state), ctypes.sizeof(state))  # ProcessPowerThrottling
+    except Exception:
+        pass
 
 
 class Spring:
@@ -343,8 +434,13 @@ class Spring:
 
 class App:
     def __init__(self, start_hidden: bool):
-        self.hs = Headset()
         self.ui_q: "queue.Queue[str]" = queue.Queue()
+        self.wake_ok = False  # se activa cuando la ventana ya existe
+        self.hs = Headset(on_change=self.wake)
+        self._after = None
+        self._sig = None
+        self._theme_t = 0.0
+        self._visible = not start_hidden
         self.touched = {}
         self.auto = autostart_enabled()
 
@@ -381,6 +477,8 @@ class App:
         self.cv.bind("<ButtonPress-1>", self.on_press)
         self.cv.bind("<ButtonRelease-1>", self.on_release)
         self.cv.bind("<Motion>", self.on_motion)
+        self.root.bind("<<Wake>>", lambda _e: self.tick())
+        self.f_big = tkfont.Font(family=self.fam_l, size=-self.px(52))
         self.root.update_idletasks()
         self.apply_theme()
 
@@ -390,7 +488,12 @@ class App:
         self.sync(snap=True)
         if start_hidden:
             self.root.withdraw()
-        self.root.after(500, self.tick)
+            set_eco_mode(True)
+        else:
+            self.draw()
+            self.hs.send("active", True)
+        self.wake_ok = True
+        self._after = self.root.after(500, self.tick)
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -450,15 +553,21 @@ class App:
         self.kick()
 
     def kick(self):
+        if self.running or not any(sp.moving for sp in self.sp.values()):
+            return
         if reduce_motion():
             for sp in self.sp.values():
                 sp.x, sp.v = sp.t, 0.0
-        if not self.running:
-            self.running = True
-            self.last_t = time.time()
-            self._frame()
+            self.draw()
+            return
+        self.running = True
+        self.last_t = time.time()
+        self._frame()
 
     def _frame(self):
+        if not self._visible:
+            self.running = False
+            return
         now = time.time()
         dt, self.last_t = now - self.last_t, now
         moving = False
@@ -517,7 +626,7 @@ class App:
         # batería
         b = s["battery"] if conn else None
         num = f"{b}" if b is not None else "–"
-        f = tkfont.Font(family=self.fam_l, size=-self.px(52))
+        f = self.f_big
         cv.create_text(self.px(22), self.px(96), text=num, anchor="w",
                        fill=c["text"] if b is not None else dim, font=f)
         if b is not None:
@@ -642,14 +751,36 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Salir", lambda *_: self.ui_q.put("quit")))
 
+    def wake(self):
+        """Despierta el ciclo de la UI desde otro hilo (BLE o bandeja)."""
+        if not self.wake_ok:
+            return
+        try:
+            self.root.event_generate("<<Wake>>", when="tail")
+        except Exception:
+            self.wake_ok = False  # sin soporte entre hilos: queda el sondeo periódico
+
+    def _set_visible(self, vis):
+        if vis != self._visible:
+            self._visible = vis
+            self.hs.send("active", vis)
+            set_eco_mode(not vis)
+
     def hide(self):
         self.root.withdraw()
+        self._set_visible(False)
+        self.running = False
+        self.cv.delete("all")  # libera los gráficos mientras no se ven
+        self.imgs.clear()
+        self._sig = None
 
     def show(self):
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        self._set_visible(True)
         self.sync()
+        self.draw()
 
     def quit(self):
         try:
@@ -659,8 +790,11 @@ class App:
         self.hs.stop()
         self.root.destroy()
 
-    # --- ciclo lento: sincroniza estado, tema e icono ---
+    # --- ciclo lento y por eventos: comandos, estado, tema e icono ---
     def tick(self):
+        if self._after is not None:
+            self.root.after_cancel(self._after)
+            self._after = None
         try:
             while True:
                 cmd = self.ui_q.get_nowait()
@@ -686,15 +820,25 @@ class App:
             else:
                 tip += " — desconectado"
             self.tray.title = tip
-        if self.root.state() != "withdrawn":
-            th = system_theme()
-            if th != self.theme:
-                self.theme = th
-                self.apply_theme()
+        visible = self.root.state() == "normal"
+        self._set_visible(visible)
+        if visible:
+            now = time.monotonic()
+            if now - self._theme_t > 2:
+                self._theme_t = now
+                th = system_theme()
+                if th != self.theme:
+                    self.theme = th
+                    self.apply_theme()
+                    self._sig = None
             self.sync()
-            if not self.running:
+            sig = (tuple(sorted(s.items())), self.auto, self.theme)
+            if sig != self._sig and not self.running:  # solo redibuja si algo cambió
+                self._sig = sig
                 self.draw()
-        self.root.after(500, self.tick)
+        # oculta: casi nunca hace falta despertar; los eventos llegan por <<Wake>>
+        delay = 500 if visible else (2000 if self.wake_ok else 500)
+        self._after = self.root.after(delay, self.tick)
 
     def run(self):
         self.root.mainloop()
