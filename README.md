@@ -19,10 +19,14 @@ Pequeña aplicación de escritorio, en español, para ver el estado y controlar 
 
 Lo que **no** incluye: el EQ del auricular (los valores no coinciden con ningún nombre conocido), LDAC (Windows no usa ese códec y el cambio reinicia los auriculares) y los niveles de ANC (en las pruebas no produjeron ningún cambio medible). Detalles en [docs/PROTOCOLO-S40.md](docs/PROTOCOLO-S40.md).
 
+## Descargar (sin instalar Python)
+
+En la pestaña [Releases](../../releases/latest) descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No necesitas Python. Como el programa no está firmado, Windows puede mostrar un aviso de SmartScreen: pulsa «Más información» y «Ejecutar de todas formas».
+
 ## Requisitos
 
 - Windows 10/11 con Bluetooth y los auriculares ya emparejados con el PC.
-- Python 3.10 o superior (solo para ejecutarla desde el código o generar el instalable).
+- Python 3.10 o superior (solo si la ejecutas desde el código o generas el instalable tú mismo).
 
 ## Usarla desde el código
 
