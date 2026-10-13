@@ -1,0 +1,61 @@
+name: Publicar instalable
+
+# Genera el .zip portable (sin necesidad de instalar Python) y lo adjunta a una Release.
+# Se ejecuta al subir una etiqueta "v*" o a mano desde la pestaña Actions.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versión de la release (ej. v1.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.14 = Tcl/Tk 9, para el que está pensado rthook_tcl9.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Pruebas del protocolo
+        run: python test_protocol.py
+
+      - name: Generar icono
+        run: python make_icon.py
+
+      - name: Empaquetar con PyInstaller
+        shell: pwsh
+        run: |
+          py -m PyInstaller --noconfirm --clean --onedir --windowed --name "Haylou S40" `
+            --icon icon.ico --add-data "icon.ico;." `
+            --add-data "tcl_stub;_tcl_data" --add-data "tcl_stub;_tk_data" --runtime-hook rthook_tcl9.py `
+            --paths . --collect-submodules bleak --collect-all winrt `
+            --hidden-import pystray._win32 `
+            --exclude-module flet --exclude-module numpy --exclude-module pycaw `
+            haylou_s40.py
+          if (-not (Test-Path "dist\Haylou S40\Haylou S40.exe")) { throw "Fallo el empaquetado" }
+
+      - name: Comprimir
+        shell: pwsh
+        run: Compress-Archive -Path "dist\Haylou S40" -DestinationPath "Haylou-S40-Windows.zip"
+
+      - name: Publicar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        run: |
+          gh release create $env:VERSION Haylou-S40-Windows.zip `
+            --title "Haylou S40 para Windows $env:VERSION" `
+            --notes "Descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No hace falta instalar Python. Windows puede mostrar un aviso de SmartScreen porque el programa no está firmado: pulsa «Más información» y «Ejecutar de todas formas»."
