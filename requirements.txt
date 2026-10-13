@@ -1,0 +1,4 @@
+bleak>=0.22       # Bluetooth LE
+pystray>=0.19      # icono de bandeja
+pillow>=10.0       # dibujo de formas e icono de bandeja
+pyinstaller>=6.0   # solo para generar el instalable (build.ps1)

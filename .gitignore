@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+# Iconos locales (opcionales): si no existen, make_icon.py genera uno genérico
+icon.ico
+icon_source.jpg
