@@ -523,15 +523,11 @@ class App:
         self.chrome = self.frameless()  # barra de título propia (semáforo estilo Apple)
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
-        self.root.resizable(False, False)
+        if self.chrome:
+            self._restyle()  # sin borde de redimensionar, el tamaño ya es fijo (Tk no debe limitarlo)
+        else:
+            self.root.resizable(False, False)
         log.info("Ventana creada (barra propia: %s)", self.chrome)
-        if self.chrome:  # tras quitar la barra, fija el tamaño exacto (Tk aún cuenta la barra vieja)
-            try:
-                u = ctypes.windll.user32
-                u.SetWindowPos(u.GetParent(self.root.winfo_id()), 0, 0, 0,
-                               self.px(W), self.px(H + self.dy), 0x0002 | 0x0004)  # NOMOVE | NOZORDER
-            except Exception:
-                log.debug("No se pudo fijar el tamaño de la ventana", exc_info=True)
 
         fams = set(tkfont.families())
         self.fam = "Segoe UI Variable Text" if "Segoe UI Variable Text" in fams else "Segoe UI"
@@ -559,7 +555,7 @@ class App:
         self.cv.bind("<Motion>", self.on_motion)
         self.cv.bind("<Leave>", self.on_leave)
         self.root.bind("<<Wake>>", lambda _e: self.tick())
-        self.root.bind("<Map>", lambda e: self.tick() if e.widget is self.root else None)
+        self.root.bind("<Map>", self._on_map)
         self.f_big = tkfont.Font(family=self.fam_l, size=-self.px(52))
         self.root.update_idletasks()
         self.apply_theme()
@@ -578,6 +574,11 @@ class App:
         threading.Thread(target=self._listen_show, daemon=True).start()
         self._after = self.root.after(500, self.tick)
 
+    def _on_map(self, e):
+        if e.widget is self.root:
+            self._restyle()  # Tk restaura la barra nativa al mostrar la ventana
+            self.tick()
+
     def _listen_show(self):
         """Espera sin consumir a que una 2.ª copia pida mostrar la ventana."""
         try:
@@ -591,20 +592,32 @@ class App:
         except Exception:
             log.exception("Falló el aviso entre copias")
 
-    def frameless(self) -> bool:
-        """Quita la barra de título nativa (sigue siendo una ventana normal: barra de tareas,
-        minimizar y Alt+Tab funcionan). Si algo falla se conserva la barra nativa."""
+    def frameless(self, size=None) -> bool:
+        """Quita la barra de título nativa y el borde de redimensionar (sigue siendo una ventana
+        normal: barra de tareas, minimizar y Alt+Tab funcionan). Tk puede volver a ponerlos al
+        mostrar la ventana, así que es idempotente y se repite. Si falla se conserva la barra nativa."""
         try:
             u = ctypes.windll.user32
             hwnd = u.GetParent(self.root.winfo_id())
             style = u.GetWindowLongW(hwnd, -16)  # GWL_STYLE
-            u.SetWindowLongW(hwnd, -16, style & ~0x00C00000)  # sin WS_CAPTION
-            # SWP_NOSIZE | NOMOVE | NOZORDER | FRAMECHANGED
-            u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0004 | 0x0020)
+            new = style & ~(0x00C00000 | 0x00040000 | 0x00010000)  # CAPTION, THICKFRAME, MAXIMIZEBOX
+            if new == style and size is None:
+                return True
+            if new != style:
+                u.SetWindowLongW(hwnd, -16, new)
+            flags = 0x0002 | 0x0004 | 0x0020  # NOMOVE | NOZORDER | FRAMECHANGED
+            if size:
+                u.SetWindowPos(hwnd, 0, 0, 0, size[0], size[1], flags)
+            else:
+                u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags | 0x0001)  # NOSIZE
             return True
         except Exception:
             log.exception("No se pudo quitar la barra de título nativa")
             return False
+
+    def _restyle(self):
+        if self.chrome:
+            self.frameless((self.px(W), self.px(H + self.dy)))
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -984,6 +997,7 @@ class App:
 
     def show(self):
         self.root.deiconify()
+        self._restyle()
         self.root.lift()
         self.root.focus_force()
         self._set_visible(True)
