@@ -510,9 +510,10 @@ class App:
             repair_autostart()
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = lambda *a: log.error("Error en la interfaz", exc_info=a)
         self.root.title(APP_NAME)
         self.k = self.root.winfo_fpixels("1i") / 96.0
-        self.root.resizable(False, False)
+        log.info("Iniciando: escala %.2f", self.k)
         try:
             self.root.iconbitmap(app_icon_path())
         except Exception:
@@ -522,6 +523,8 @@ class App:
         self.chrome = self.frameless()  # barra de título propia (semáforo estilo Apple)
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
+        self.root.resizable(False, False)
+        log.info("Ventana creada (barra propia: %s)", self.chrome)
         if self.chrome:  # tras quitar la barra, fija el tamaño exacto (Tk aún cuenta la barra vieja)
             try:
                 u = ctypes.windll.user32
@@ -1047,7 +1050,9 @@ class App:
         self._after = self.root.after(delay, self.tick)
 
     def run(self):
+        log.info("Interfaz lista")
         self.root.mainloop()
+        log.info("Cerrada")
 
 
 if __name__ == "__main__":
@@ -1057,5 +1062,7 @@ if __name__ == "__main__":
         pass
     setup_logging()
     if not single_instance(signal_existing="--bandeja" not in sys.argv):
+        log.info("Ya hay otra copia abierta; se cierra esta")
         sys.exit(0)
+    log.info("Arranque %s", sys.argv)
     App(start_hidden="--bandeja" in sys.argv).run()
