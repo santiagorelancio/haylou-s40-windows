@@ -523,6 +523,7 @@ class App:
 
         self.root = tk.Tk()
         self.root.report_callback_exception = lambda *a: log.error("Error en la interfaz", exc_info=a)
+        self.root.withdraw()  # se construye oculta y se muestra al final
         self.root.title(APP_NAME)
         self.k = self.root.winfo_fpixels("1i") / 96.0
         log.info("Iniciando: escala %.2f", self.k)
@@ -531,14 +532,10 @@ class App:
         except Exception:
             pass
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
-        self.root.update_idletasks()
         self.chrome = self.frameless()  # barra de título propia (semáforo estilo Apple)
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
-        if self.chrome:
-            self._restyle(force=True)  # sin borde de redimensionar, el tamaño ya es fijo
-        else:
-            self.root.resizable(False, False)
+        self.root.resizable(False, False)
         log.info("Ventana creada (barra propia: %s)", self.chrome)
 
         fams = set(tkfont.families())
@@ -577,10 +574,10 @@ class App:
         self._last_icon = None
         self.sync(snap=True)
         if start_hidden:
-            self.root.withdraw()
             set_eco_mode(True)
         else:
             self.draw()
+            self.root.deiconify()
             self.hs.send("active", True)
         self.wake_ok = True
         threading.Thread(target=self._listen_show, daemon=True).start()
@@ -588,7 +585,6 @@ class App:
 
     def _on_map(self, e):
         if e.widget is self.root:
-            self._restyle()  # Tk restaura la barra nativa al mostrar la ventana
             self.tick()
 
     def _listen_show(self):
@@ -604,32 +600,32 @@ class App:
         except Exception:
             log.exception("Falló el aviso entre copias")
 
-    def frameless(self, size=None, force=False) -> bool:
-        """Quita la barra de título nativa y el borde de redimensionar (sigue siendo una ventana
-        normal: barra de tareas, minimizar y Alt+Tab funcionan). Tk puede volver a ponerlos al
-        mostrar la ventana, así que es idempotente y se repite. Si falla se conserva la barra nativa."""
+    def frameless(self) -> bool:
+        """Ventana sin barra de título con el método estándar de Tk (overrideredirect). Se le
+        devuelve el botón en la barra de tareas. Si algo falla se conserva la barra nativa."""
         try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(self.root.winfo_id())
-            style = u.GetWindowLongW(hwnd, -16)  # GWL_STYLE
-            new = style & ~(0x00C00000 | 0x00040000 | 0x00010000)  # CAPTION, THICKFRAME, MAXIMIZEBOX
-            if new == style and not force:
-                return True
-            if new != style:
-                u.SetWindowLongW(hwnd, -16, new)
-            flags = 0x0002 | 0x0004 | 0x0020  # NOMOVE | NOZORDER | FRAMECHANGED
-            if size:
-                u.SetWindowPos(hwnd, 0, 0, 0, size[0], size[1], flags)
-            else:
-                u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags | 0x0001)  # NOSIZE
+            self.root.overrideredirect(True)
+            self._appwindow()
             return True
         except Exception:
             log.exception("No se pudo quitar la barra de título nativa")
+            try:
+                self.root.overrideredirect(False)
+            except Exception:
+                pass
             return False
 
-    def _restyle(self, force=False):
-        if self.chrome:
-            self.frameless((self.px(W), self.px(H + self.dy)), force)
+    def _appwindow(self):
+        """Estilo de ventana de aplicación: aparece en la barra de tareas y en Alt+Tab."""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.root.winfo_id())
+            ex = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            new = (ex & ~0x00000080) | 0x00040000  # sin TOOLWINDOW, con APPWINDOW
+            if new != ex:
+                u.SetWindowLongW(hwnd, -20, new)
+        except Exception:
+            log.debug("No se pudo fijar el estilo de ventana", exc_info=True)
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -919,8 +915,10 @@ class App:
 
     def minimize(self):
         try:
-            self.root.iconify()
-        except tk.TclError:
+            u = ctypes.windll.user32
+            u.ShowWindow(u.GetParent(self.root.winfo_id()), 6)  # SW_MINIMIZE
+        except Exception:
+            log.debug("No se pudo minimizar", exc_info=True)
             self.hide()
 
     # --- acciones ---
@@ -1011,8 +1009,8 @@ class App:
         self._sig = None
 
     def show(self):
+        self._appwindow()
         self.root.deiconify()
-        self._restyle()
         self.root.lift()
         self.root.focus_force()
         self._set_visible(True)
