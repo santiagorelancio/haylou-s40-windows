@@ -551,6 +551,7 @@ class App:
         self.regions = []
         self.cregions = []  # zonas de la barra superior (coordenadas de ventana)
         self.hover_chrome = False
+        self._drag = None
         self.pressed = None
         self.sp = {"bar": Spring(0, 0.5), "auto": Spring(int(self.auto))}
         for key in SEGMENTS:
@@ -562,6 +563,7 @@ class App:
         self.cv.bind("<ButtonPress-1>", self.on_press)
         self.cv.bind("<ButtonRelease-1>", self.on_release)
         self.cv.bind("<Motion>", self.on_motion)
+        self.cv.bind("<B1-Motion>", self.on_drag)
         self.cv.bind("<Leave>", self.on_leave)
         self.root.bind("<<Wake>>", lambda _e: self.tick())
         self.root.bind("<Map>", self._on_map)
@@ -871,24 +873,20 @@ class App:
                 return ident, fn
         return None, None
 
-    def start_drag(self):
-        """Mueve la ventana con el movimiento nativo de Windows (incluye ajuste a bordes)."""
-        try:
-            u = ctypes.windll.user32
-            hwnd = u.GetParent(self.root.winfo_id())
-            u.ReleaseCapture()
-            u.SendMessageW(hwnd, 0xA1, 2, 0)  # WM_NCLBUTTONDOWN, HTCAPTION
-        except Exception:
-            log.debug("No se pudo arrastrar la ventana", exc_info=True)
-
     def on_press(self, e):
         self.pressed, _ = self.hit(e)
         if self.pressed is None and self.chrome and e.y / self.k < self.dy + 44:
-            self.start_drag()  # zona de título: arrastrar
+            # zona de título: arrastrar la ventana (solo con eventos de Tk)
+            self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
             return
         self.draw()
 
+    def on_drag(self, e):
+        if self._drag:
+            self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
+
     def on_release(self, e):
+        self._drag = None
         ident, fn = self.hit(e)
         was, self.pressed = self.pressed, None
         if ident and ident == was:
