@@ -4,9 +4,13 @@ Ventana pequeña + icono en la bandeja. Hablamos por Bluetooth LE con los
 auriculares mientras siguen conectados como audio normal.
 """
 import asyncio
+import atexit
 import ctypes
+import faulthandler
 import functools
 import json
+import logging
+import logging.handlers
 import os
 import queue
 import sys
@@ -27,6 +31,10 @@ APP_NAME = "Haylou S40"
 APP_DIR = os.path.join(os.environ.get("APPDATA", "."), "HaylouS40")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+SHOW_EVENT = "HaylouS40_Show"  # una 2.ª copia lo activa para traer al frente la ventana ya abierta
+
+log = logging.getLogger("haylou")
+log.addHandler(logging.NullHandler())
 
 MODE_NAMES = {P.ANC_NORMAL: "Off", P.ANC_ANC: "Cancelación de ruido (ANC)", P.ANC_ADAPTIVE: "ANC adaptativo", P.ANC_TRANSP: "Sonido ambiente"}
 MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5E5CE6", P.ANC_TRANSP: "#30D158"}
@@ -34,21 +42,53 @@ MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5
 
 
 # ───────────────────────── configuración ─────────────────────────
+_crash_fh = None
+
+
+def setup_logging():
+    """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola."""
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        h = logging.handlers.RotatingFileHandler(os.path.join(APP_DIR, "haylou.log"),
+                                                 maxBytes=200_000, backupCount=1, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(h)
+        log.setLevel(logging.INFO)
+    except Exception:
+        pass
+    try:  # si el proceso muere de golpe (fallo nativo), deja la traza en haylou-crash.log
+        global _crash_fh
+        _crash_fh = open(os.path.join(APP_DIR, "haylou-crash.log"), "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:
+        pass
+    atexit.register(lambda: log.info("El proceso termina con normalidad"))
+    sys.excepthook = lambda *a: log.error("Excepción no controlada", exc_info=a)
+    threading.excepthook = lambda a: log.error(
+        "Excepción en hilo %s", a.thread.name if a.thread else "?",
+        exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+
+
 def load_config() -> dict:
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f)
+    except FileNotFoundError:
+        return {}
     except Exception:
+        log.exception("No se pudo leer la configuración")
         return {}
 
 
 def save_config(cfg: dict):
     try:
         os.makedirs(APP_DIR, exist_ok=True)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f)
+        os.replace(tmp, CONFIG_PATH)  # escritura atómica: nunca queda a medias
     except Exception:
-        pass
+        log.exception("No se pudo guardar la configuración")
 
 
 def exe_command() -> str:
@@ -77,9 +117,38 @@ def set_autostart(on: bool):
                 pass
 
 
-def single_instance() -> bool:
-    ctypes.windll.kernel32.CreateMutexW(None, False, "HaylouS40_SingleInstance")
-    return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+def repair_autostart():
+    """Si el inicio con Windows apunta a una ruta vieja (carpeta movida o reinstalada), lo corrige.
+    Desde el código fuente solo se toca si el destino guardado ya no existe."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            stored = winreg.QueryValueEx(k, "HaylouS40")[0]
+    except OSError:
+        return
+    target = stored.split('"')[1] if stored.startswith('"') and stored.count('"') >= 2 else stored.split(" ")[0]
+    if stored != exe_command() and (getattr(sys, "frozen", False) or not os.path.exists(target)):
+        try:
+            set_autostart(True)
+            log.info("Inicio con Windows actualizado: %s", exe_command())
+        except Exception:
+            log.exception("No se pudo actualizar el inicio con Windows")
+
+
+def single_instance(signal_existing=True) -> bool:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # el error se guarda por llamada
+    k32.CreateMutexW(None, False, "HaylouS40_SingleInstance")
+    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
+        return True
+    if signal_existing:  # avisa a la copia que ya corre para que muestre su ventana
+        try:
+            k32.OpenEventW.restype = ctypes.c_void_p
+            h = k32.OpenEventW(0x0002, False, SHOW_EVENT)  # EVENT_MODIFY_STATE
+            if h:
+                k32.SetEvent(ctypes.c_void_p(h))
+                k32.CloseHandle(ctypes.c_void_p(h))
+        except Exception:
+            pass
+    return False
 
 
 # ───────────────────────── Bluetooth ─────────────────────────
@@ -133,7 +202,7 @@ class Headset:
             try:
                 self.on_change()
             except Exception:
-                pass
+                log.debug("on_change falló", exc_info=True)
 
     def _status(self, text, connected=None):
         self.state["status"] = text
@@ -202,6 +271,7 @@ class Headset:
             self.cfg["addr"] = dev.address
             save_config(self.cfg)
         self._status("Conectado", True)
+        log.info("Conectado a %s", dev.address)
         return True
 
     def _alive(self):
@@ -221,7 +291,7 @@ class Headset:
             if self.client:
                 await self.client.disconnect()
         except Exception:
-            pass
+            log.debug("Error al desconectar", exc_info=True)
         self.client = None
         self.state["connected"] = False
 
@@ -238,6 +308,7 @@ class Headset:
             now = time.monotonic()
             if not self._alive():
                 if self.state["connected"]:
+                    log.info("Conexión perdida")
                     self._status("Conexión perdida, reconectando…", False)
                 if now >= next_try:
                     try:
@@ -246,6 +317,7 @@ class Headset:
                             await self._refresh()
                     except Exception as e:
                         ok = False
+                        log.warning("No se pudo conectar: %r", e, exc_info=True)
                         await self._drop()
                         self._status(f"No se pudo conectar ({type(e).__name__}). Reintentando…", False)
                     now = time.monotonic()
@@ -302,6 +374,7 @@ class Headset:
                             next_batt = now + (POLL_BATT_VISIBLE if self.active else POLL_BATT_HIDDEN)
                         next_state = now + POLL_STATE_VISIBLE if self.active else inf
             except Exception:
+                log.warning("Error en la conexión con los auriculares", exc_info=True)
                 await self._drop()
                 self._changed()
         await self._drop()
@@ -373,6 +446,7 @@ SWITCHES = [("game", "Modo juego", "Baja latencia"),
             ("multi", "Multipunto", "Conectar dos dispositivos a la vez"),
             ("auto", "Iniciar con Windows", None)]
 W, H = 320, 650
+TOP_BAR = 18  # alto extra para los botones de ventana
 
 
 def system_theme() -> str:
@@ -443,17 +517,26 @@ class App:
         self._visible = not start_hidden
         self.touched = {}
         self.auto = autostart_enabled()
+        self._warned = set()  # umbrales de batería baja ya avisados
+        if self.auto:
+            repair_autostart()
 
         self.root = tk.Tk()
+        self.root.report_callback_exception = lambda *a: log.error("Error en la interfaz", exc_info=a)
+        self.root.withdraw()  # se construye oculta y se muestra al final
         self.root.title(APP_NAME)
         self.k = self.root.winfo_fpixels("1i") / 96.0
-        self.root.geometry(f"{self.px(W)}x{self.px(H)}")
-        self.root.resizable(False, False)
+        log.info("Iniciando: escala %.2f", self.k)
         try:
             self.root.iconbitmap(app_icon_path())
         except Exception:
             pass
         self.root.protocol("WM_DELETE_WINDOW", self.hide)
+        self.chrome = self.frameless()  # barra de título propia (semáforo estilo Apple)
+        self.dy = TOP_BAR if self.chrome else 0
+        self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
+        self.root.resizable(False, False)
+        log.info("Ventana creada (barra propia: %s)", self.chrome)
 
         fams = set(tkfont.families())
         self.fam = "Segoe UI Variable Text" if "Segoe UI Variable Text" in fams else "Segoe UI"
@@ -462,10 +545,13 @@ class App:
 
         self.theme = system_theme()
         self.c = PALETTES[self.theme]
-        self.cv = tk.Canvas(self.root, width=self.px(W), height=self.px(H), highlightthickness=0, bd=0)
+        self.cv = tk.Canvas(self.root, width=self.px(W), height=self.px(H + self.dy), highlightthickness=0, bd=0)
         self.cv.pack()
         self.imgs = {}
         self.regions = []
+        self.cregions = []  # zonas de la barra superior (coordenadas de ventana)
+        self.hover_chrome = False
+        self._drag = None
         self.pressed = None
         self.sp = {"bar": Spring(0, 0.5), "auto": Spring(int(self.auto))}
         for key in SEGMENTS:
@@ -477,7 +563,10 @@ class App:
         self.cv.bind("<ButtonPress-1>", self.on_press)
         self.cv.bind("<ButtonRelease-1>", self.on_release)
         self.cv.bind("<Motion>", self.on_motion)
+        self.cv.bind("<B1-Motion>", self.on_drag)
+        self.cv.bind("<Leave>", self.on_leave)
         self.root.bind("<<Wake>>", lambda _e: self.tick())
+        self.root.bind("<Map>", self._on_map)
         self.f_big = tkfont.Font(family=self.fam_l, size=-self.px(52))
         self.root.update_idletasks()
         self.apply_theme()
@@ -487,13 +576,58 @@ class App:
         self._last_icon = None
         self.sync(snap=True)
         if start_hidden:
-            self.root.withdraw()
             set_eco_mode(True)
         else:
             self.draw()
+            self.root.deiconify()
             self.hs.send("active", True)
         self.wake_ok = True
+        threading.Thread(target=self._listen_show, daemon=True).start()
         self._after = self.root.after(500, self.tick)
+
+    def _on_map(self, e):
+        if e.widget is self.root:
+            self.tick()
+
+    def _listen_show(self):
+        """Espera sin consumir a que una 2.ª copia pida mostrar la ventana."""
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.CreateEventW.restype = ctypes.c_void_p
+            ev = k32.CreateEventW(None, False, False, SHOW_EVENT)
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            while ev and k32.WaitForSingleObject(ev, 0xFFFFFFFF) == 0:
+                self.ui_q.put("show")
+                self.wake()
+        except Exception:
+            log.exception("Falló el aviso entre copias")
+
+    def frameless(self) -> bool:
+        """Ventana sin barra de título con el método estándar de Tk (overrideredirect). Se le
+        devuelve el botón en la barra de tareas. Si algo falla se conserva la barra nativa."""
+        try:
+            self.root.overrideredirect(True)
+            self._appwindow()
+            return True
+        except Exception:
+            log.exception("No se pudo quitar la barra de título nativa")
+            try:
+                self.root.overrideredirect(False)
+            except Exception:
+                pass
+            return False
+
+    def _appwindow(self):
+        """Estilo de ventana de aplicación: aparece en la barra de tareas y en Alt+Tab."""
+        try:
+            u = ctypes.windll.user32
+            hwnd = u.GetParent(self.root.winfo_id())
+            ex = u.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            new = (ex & ~0x00000080) | 0x00040000  # sin TOOLWINDOW, con APPWINDOW
+            if new != ex:
+                u.SetWindowLongW(hwnd, -20, new)
+        except Exception:
+            log.debug("No se pudo fijar el estilo de ventana", exc_info=True)
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -512,11 +646,12 @@ class App:
             self.imgs[key] = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
         return self.imgs[key]
 
-    def put(self, x, y, w, h, color, r=None):
-        self.cv.create_image(self.px(x), self.px(y), image=self.shape(w, h, color, r), anchor="nw")
+    def put(self, x, y, w, h, color, r=None, dy=None):
+        dy = self.dy if dy is None else dy
+        self.cv.create_image(self.px(x), self.px(y + dy), image=self.shape(w, h, color, r), anchor="nw")
 
     def text(self, x, y, s, size, color, weight="normal", anchor="w", fam=None):
-        self.cv.create_text(self.px(x), self.px(y), text=s, anchor=anchor, fill=color,
+        self.cv.create_text(self.px(x), self.px(y + self.dy), text=s, anchor=anchor, fill=color,
                             font=(fam or self.fam, -self.px(size), weight))
 
     def apply_theme(self):
@@ -531,8 +666,14 @@ class App:
             col = self.c["bg"].lstrip("#")
             bgr = ctypes.c_int(int(col[4:6] + col[2:4] + col[0:2], 16))
             ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(bgr), 4)  # color de barra (Win11)
+            if self.chrome:
+                round_ = ctypes.c_int(2)  # DWMWCP_ROUND
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(round_), 4)
+                hair = self.c["hair"].lstrip("#")
+                edge = ctypes.c_int(int(hair[4:6] + hair[2:4] + hair[0:2], 16))
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(edge), 4)  # borde
         except Exception:
-            pass
+            log.debug("DWM: atributos no disponibles", exc_info=True)
 
     # --- estado -> objetivos de animación ---
     def _fresh(self, key):
@@ -627,7 +768,7 @@ class App:
         b = s["battery"] if conn else None
         num = f"{b}" if b is not None else "–"
         f = self.f_big
-        cv.create_text(self.px(22), self.px(96), text=num, anchor="w",
+        cv.create_text(self.px(22), self.px(96 + self.dy), text=num, anchor="w",
                        fill=c["text"] if b is not None else dim, font=f)
         if b is not None:
             self.text(24 + f.measure(num) / self.k + 4, 106, "%", 20, dim, fam=self.fam_l)
@@ -673,7 +814,7 @@ class App:
             kx = sx + 3 + (sw_w - 6 - kw) * max(0.0, min(1.0, v))
             self.put(kx, sy + 3, kw, 22, "#FFFFFF" if enabled else "#EDEDF0")
             if i:
-                cv.create_line(self.px(40), self.px(y), self.px(280), self.px(y), fill=c["hair"])
+                cv.create_line(self.px(40), self.px(y + self.dy), self.px(280), self.px(y + self.dy), fill=c["hair"])
             if enabled:
                 self.regions.append((24, y, 296, y + rh, ("row", key), lambda k=key: self.toggle(k)))
 
@@ -684,6 +825,34 @@ class App:
             self.text(x, fy, label, 12, c["accent"], anchor=anc)
             xs = x if anc == "w" else x - wd
             self.regions.append((xs - 6, fy - 14, xs + wd + 6, fy + 14, ("foot", label), fn))
+        self.draw_chrome()
+
+    def draw_chrome(self):
+        """Botones de ventana estilo Apple: cerrar (a la bandeja), minimizar y zoom (no aplica)."""
+        self.cregions = []
+        if not self.chrome:
+            return
+        c, cv = self.c, self.cv
+        specs = (("close", "#FF5F57", "#E0443E", "#4D0000", self.hide),
+                 ("min", "#FEBC2E", "#DEA123", "#985700", self.minimize),
+                 ("zoom", None, None, None, None))  # la ventana no se redimensiona: queda gris
+        for i, (name, fill, edge, glyph, fn) in enumerate(specs):
+            x, y = 14 + i * 20, 11
+            if fill is None:
+                fill, edge = c["off"], c["hair"]
+            self.put(x, y, 12, 12, edge, dy=0)
+            self.put(x + 1, y + 1, 10, 10, fill, dy=0)
+            if self.hover_chrome and glyph:
+                w = max(1, int(round(1.4 * self.k)))
+                if name == "close":
+                    for a, b in (((3.6, 3.6), (8.4, 8.4)), ((8.4, 3.6), (3.6, 8.4))):
+                        cv.create_line(self.px(x + a[0]), self.px(y + a[1]), self.px(x + b[0]),
+                                       self.px(y + b[1]), fill=glyph, width=w)
+                else:
+                    cv.create_line(self.px(x + 3), self.px(y + 6), self.px(x + 9), self.px(y + 6),
+                                   fill=glyph, width=w)
+            if fn:
+                self.cregions.append((x - 4, y - 5, x + 16, y + 17, ("chrome", name), fn))
 
     @staticmethod
     def _mix(a, b, t):
@@ -695,6 +864,10 @@ class App:
     # --- entrada: feedback al pulsar, acción al soltar dentro del mismo elemento ---
     def hit(self, e):
         x, y = e.x / self.k, e.y / self.k
+        for x0, y0, x1, y1, ident, fn in self.cregions:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return ident, fn
+        y -= self.dy
         for x0, y0, x1, y1, ident, fn in self.regions:
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return ident, fn
@@ -702,18 +875,49 @@ class App:
 
     def on_press(self, e):
         self.pressed, _ = self.hit(e)
+        if self.pressed is None and self.chrome and e.y / self.k < self.dy + 44:
+            # zona de título: arrastrar la ventana (solo con eventos de Tk)
+            self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+            return
         self.draw()
 
+    def on_drag(self, e):
+        if self._drag:
+            self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
+
     def on_release(self, e):
+        self._drag = None
         ident, fn = self.hit(e)
         was, self.pressed = self.pressed, None
         if ident and ident == was:
             fn()
-        self.draw()
+        try:
+            if self.root.state() == "normal":
+                self.draw()
+        except tk.TclError:
+            pass  # la ventana ya se cerró (Salir)
+
+    def _set_hover(self, h):
+        if h != self.hover_chrome:
+            self.hover_chrome = h
+            if not self.running:
+                self.draw()
 
     def on_motion(self, e):
         ident, _ = self.hit(e)
         self.cv.configure(cursor="hand2" if ident else "")
+        self._set_hover(bool(ident and ident[0] == "chrome"))
+
+    def on_leave(self, _e):
+        self._set_hover(False)
+
+    def minimize(self):
+        try:
+            u = ctypes.windll.user32
+            u.ShowWindow(u.GetParent(self.root.winfo_id()), 6)  # SW_MINIMIZE
+        except Exception:
+            log.debug("No se pudo minimizar", exc_info=True)
+            self.hide()
 
     # --- acciones ---
     def set_value(self, key, v):
@@ -749,6 +953,9 @@ class App:
             pystray.Menu.SEPARATOR,
             *[mode_item(m) for m in SEGMENTS["anc"]["values"]],
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Avisar de batería baja", self._toggle_lowbatt,
+                             checked=lambda _i: self.hs.cfg.get("low_batt_notify", True)),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Salir", lambda *_: self.ui_q.put("quit")))
 
     def wake(self):
@@ -766,15 +973,41 @@ class App:
             self.hs.send("active", vis)
             set_eco_mode(not vis)
 
+    def _toggle_lowbatt(self, *_):
+        self.hs.cfg["low_batt_notify"] = not self.hs.cfg.get("low_batt_notify", True)
+        save_config(self.hs.cfg)
+
+    def _check_battery(self, conn, b):
+        """Notificación de Windows al bajar del 20 % y del 10 %; se rearma al pasar del 30 %."""
+        if not conn or b is None:
+            return
+        if b >= 30:
+            self._warned.clear()
+            return
+        if not self.hs.cfg.get("low_batt_notify", True):
+            return
+        lvl = 10 if b <= 10 else 20 if b <= 20 else None
+        if lvl is None or lvl in self._warned:
+            return
+        self._warned.update(l for l in (10, 20) if l >= lvl)
+        msg = (f"Batería muy baja: {b} %. Carga los auriculares pronto." if lvl == 10
+               else f"Batería baja: {b} %. Conviene cargar los auriculares.")
+        try:
+            self.tray.notify(msg, APP_NAME)
+        except Exception:
+            log.debug("No se pudo mostrar la notificación", exc_info=True)
+
     def hide(self):
         self.root.withdraw()
         self._set_visible(False)
+        self.hover_chrome = False
         self.running = False
         self.cv.delete("all")  # libera los gráficos mientras no se ven
         self.imgs.clear()
         self._sig = None
 
     def show(self):
+        self._appwindow()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -809,6 +1042,7 @@ class App:
             pass
         s = self.hs.state
         conn, b = s["connected"], s["battery"]
+        self._check_battery(conn, b)
         key = (b if conn else None, s["anc"], conn)
         if key != self._last_icon:
             self._last_icon = key
@@ -841,7 +1075,9 @@ class App:
         self._after = self.root.after(delay, self.tick)
 
     def run(self):
+        log.info("Interfaz lista")
         self.root.mainloop()
+        log.info("Cerrada")
 
 
 if __name__ == "__main__":
@@ -849,6 +1085,9 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    if not single_instance():
+    setup_logging()
+    if not single_instance(signal_existing="--bandeja" not in sys.argv):
+        log.info("Ya hay otra copia abierta; se cierra esta")
         sys.exit(0)
+    log.info("Arranque %s", sys.argv)
     App(start_hidden="--bandeja" in sys.argv).run()
