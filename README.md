@@ -4,6 +4,10 @@ Pequeña aplicación de escritorio, en español, para ver el estado y controlar 
 
 > Proyecto no oficial, sin relación con Haylou. Se probó con un único par de auriculares S40; otros modelos o versiones de firmware pueden comportarse distinto. Úsalo bajo tu propia responsabilidad.
 
+## Captura
+
+<p align="center"><img src="docs/img/app-conectada.png" alt="Haylou S40 para Windows: batería, control de ruido, audio espacial y ajustes" width="280"></p>
+
 ## Qué hace
 
 - Muestra la **batería** y el estado de conexión, y se refresca sola.
