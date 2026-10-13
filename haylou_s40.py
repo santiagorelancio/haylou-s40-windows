@@ -4,7 +4,9 @@ Ventana pequeña + icono en la bandeja. Hablamos por Bluetooth LE con los
 auriculares mientras siguen conectados como audio normal.
 """
 import asyncio
+import atexit
 import ctypes
+import faulthandler
 import functools
 import json
 import logging
@@ -40,6 +42,9 @@ MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5
 
 
 # ───────────────────────── configuración ─────────────────────────
+_crash_fh = None
+
+
 def setup_logging():
     """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola."""
     try:
@@ -51,6 +56,13 @@ def setup_logging():
         log.setLevel(logging.INFO)
     except Exception:
         pass
+    try:  # si el proceso muere de golpe (fallo nativo), deja la traza en haylou-crash.log
+        global _crash_fh
+        _crash_fh = open(os.path.join(APP_DIR, "haylou-crash.log"), "a", encoding="utf-8")
+        faulthandler.enable(file=_crash_fh, all_threads=True)
+    except Exception:
+        pass
+    atexit.register(lambda: log.info("El proceso termina con normalidad"))
     sys.excepthook = lambda *a: log.error("Excepción no controlada", exc_info=a)
     threading.excepthook = lambda a: log.error(
         "Excepción en hilo %s", a.thread.name if a.thread else "?",
@@ -123,12 +135,12 @@ def repair_autostart():
 
 
 def single_instance(signal_existing=True) -> bool:
-    ctypes.windll.kernel32.CreateMutexW(None, False, "HaylouS40_SingleInstance")
-    if ctypes.windll.kernel32.GetLastError() != 183:  # ERROR_ALREADY_EXISTS
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # el error se guarda por llamada
+    k32.CreateMutexW(None, False, "HaylouS40_SingleInstance")
+    if ctypes.get_last_error() != 183:  # ERROR_ALREADY_EXISTS
         return True
     if signal_existing:  # avisa a la copia que ya corre para que muestre su ventana
         try:
-            k32 = ctypes.windll.kernel32
             k32.OpenEventW.restype = ctypes.c_void_p
             h = k32.OpenEventW(0x0002, False, SHOW_EVENT)  # EVENT_MODIFY_STATE
             if h:
@@ -524,7 +536,7 @@ class App:
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
         if self.chrome:
-            self._restyle()  # sin borde de redimensionar, el tamaño ya es fijo (Tk no debe limitarlo)
+            self._restyle(force=True)  # sin borde de redimensionar, el tamaño ya es fijo
         else:
             self.root.resizable(False, False)
         log.info("Ventana creada (barra propia: %s)", self.chrome)
@@ -592,7 +604,7 @@ class App:
         except Exception:
             log.exception("Falló el aviso entre copias")
 
-    def frameless(self, size=None) -> bool:
+    def frameless(self, size=None, force=False) -> bool:
         """Quita la barra de título nativa y el borde de redimensionar (sigue siendo una ventana
         normal: barra de tareas, minimizar y Alt+Tab funcionan). Tk puede volver a ponerlos al
         mostrar la ventana, así que es idempotente y se repite. Si falla se conserva la barra nativa."""
@@ -601,7 +613,7 @@ class App:
             hwnd = u.GetParent(self.root.winfo_id())
             style = u.GetWindowLongW(hwnd, -16)  # GWL_STYLE
             new = style & ~(0x00C00000 | 0x00040000 | 0x00010000)  # CAPTION, THICKFRAME, MAXIMIZEBOX
-            if new == style and size is None:
+            if new == style and not force:
                 return True
             if new != style:
                 u.SetWindowLongW(hwnd, -16, new)
@@ -615,9 +627,9 @@ class App:
             log.exception("No se pudo quitar la barra de título nativa")
             return False
 
-    def _restyle(self):
+    def _restyle(self, force=False):
         if self.chrome:
-            self.frameless((self.px(W), self.px(H + self.dy)))
+            self.frameless((self.px(W), self.px(H + self.dy)), force)
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -885,8 +897,11 @@ class App:
         was, self.pressed = self.pressed, None
         if ident and ident == was:
             fn()
-        if self.root.state() == "normal":
-            self.draw()
+        try:
+            if self.root.state() == "normal":
+                self.draw()
+        except tk.TclError:
+            pass  # la ventana ya se cerró (Salir)
 
     def _set_hover(self, h):
         if h != self.hover_chrome:
