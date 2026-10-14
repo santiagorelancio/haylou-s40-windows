@@ -160,7 +160,7 @@ SETTABLE = {"anc": P.ATTR_ANC, "game": P.ATTR_GAME, "wind": P.ATTR_WIND,
 # icono de bandeja: los cambios hechos con el botón físico llegan solos por notificación.
 POLL_STATE_VISIBLE = 5
 POLL_BATT_VISIBLE = 30
-POLL_BATT_HIDDEN = 120
+POLL_BATT_HIDDEN = 300
 RETRY_MIN, RETRY_MAX_HIDDEN, RETRY_MAX_VISIBLE = 8, 60, 15
 
 
