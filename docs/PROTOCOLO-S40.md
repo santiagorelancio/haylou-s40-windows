@@ -34,7 +34,7 @@ Respuesta de batería: termina en `02 02 <porcentaje> ddeeff`.
 
 ### Estado completo (op `0x09`)
 
-La respuesta trae, tras unos campos de identificación (incluida la dirección del dispositivo), una lista de campos `02 <ordinal> <valor>`. Los usados:
+El cuerpo de la respuesta (desde el byte 9) es una lista TLV: `<largo> <ordinal> <datos de largo-1 bytes>`. Primero vienen campos de identificación más largos (p. ej. `07 00 <dirección de 6 bytes>`) y después los ajustes, que son campos de un byte: `02 <ordinal> <valor>`. Conviene recorrerlo como TLV: si la dirección del dispositivo contiene un `02`, buscar tripletas `02 xx yy` a ciegas se desalinea y puede perder un ajuste. Los usados:
 
 | Ordinal (lectura) | Atributo (escritura) | Función | Valores |
 |---|---|---|---|

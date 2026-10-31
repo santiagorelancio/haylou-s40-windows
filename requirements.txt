@@ -1,4 +1,4 @@
-bleak>=0.22       # Bluetooth LE
+bleak>=1.0        # Bluetooth LE (BLEDevice sin rssi desde 1.0)
 pystray>=0.19      # icono de bandeja
 pillow>=10.0       # dibujo de formas e icono de bandeja
 pyinstaller>=6.0   # solo para generar el instalable (build.ps1)

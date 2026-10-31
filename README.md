@@ -49,7 +49,7 @@ Empaqueta la app con PyInstaller, la instala para tu usuario en `%LOCALAPPDATA%\
 
 - **Solo un dispositivo puede controlar los auriculares a la vez.** Si la app oficial del celular (o una segunda copia de esta app) está conectada, los auriculares esconden sus servicios de control y esta app mostrará que no responden. Cierra la otra app y pulsa «Reconectar». Con el **multipunto** activado el celular puede conectarse a la vez para el audio.
 - La primera conexión puede tardar entre 10 y 20 segundos.
-- Si algo falla, el registro está en `%APPDATA%\HaylouS40\haylou.log`.
+- Si algo falla, el registro está en `%APPDATA%\HaylouS40\haylou.log`. Arrancando con `--debug` (`python haylou_s40.py --debug`) se guardan también las tramas BLE enviadas y recibidas.
 - La app habla con los auriculares por Bluetooth LE mientras siguen conectados como audio normal; no cambia nada del audio de Windows.
 
 ## Cómo funciona

@@ -1,0 +1,22 @@
+name: Pruebas
+
+# Las pruebas del protocolo son Python puro (sin Bluetooth), así que corren en Linux.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  protocolo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Pruebas del protocolo
+        run: python test_protocol.py
+      - name: Análisis estático
+        run: |
+          pip install pyflakes
+          python -m pyflakes haylou_s40.py s40_protocol.py test_protocol.py make_icon.py rthook_tcl9.py

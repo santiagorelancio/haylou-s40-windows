@@ -19,6 +19,12 @@ FULL = bytes.fromhex("aabbcc0009005900090700c6bde531b22407010000000000000302f700
 rf = p.parse_run_info(FULL)
 check("espacial off", rf[p.ORD_SPATIAL], 2)
 check("multipunto on", rf[p.ORD_MULTI], 1)
+check("sin campos fantasma", 0xF7 in rf, False)
+# Dirección que termina en 0x02 justo antes de un campo: no debe tragarse el ANC
+ADDR02 = bytes.fromhex("aabbcc0009000e00090700c6bde531b202020904ddeeff")
+check("tlv con 02 en la dirección", p.parse_run_info(ADDR02), {p.ORD_ANC: p.ANC_ADAPTIVE})
+# Trama que no encaja como TLV: respaldo con la búsqueda de tripletas
+check("respaldo sin tlv", p.parse_run_info(bytes.fromhex("aabbcc000900050009ff020901ddeeff")), {p.ORD_ANC: 1})
 check("ack no es run info", p.parse_run_info(ACK), {})
 check("set anc=1", p.build_set(p.ATTR_ANC, 1).hex(), "aabbcc8008000401020401ddeeff")
 check("get battery", p.build_get_battery().hex(), "aabbccc00200050200000004ddeeff")

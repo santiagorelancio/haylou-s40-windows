@@ -57,11 +57,28 @@ def parse_battery(frame: bytes):
 
 
 def parse_run_info(frame: bytes) -> dict:
-    """Respuesta de GET_RUN_INFO -> {ordinal: valor}. Valor 0xff = no disponible."""
+    """Respuesta de GET_RUN_INFO -> {ordinal: valor}. Valor 0xff = no disponible.
+
+    El cuerpo es una lista TLV: <largo> <ordinal> <datos (largo-1 bytes)>. Solo se
+    devuelven los campos de un byte (largo 2), que son los ajustes. Recorrerlo como
+    TLV evita confundir un 0x02 dentro de la dirección del dispositivo con el
+    inicio de un campo. Si la trama no encaja como TLV, se usa la búsqueda de
+    tripletas «02 ord valor» como respaldo."""
     out = {}
     if not (is_valid(frame) and frame[4] == 0x09):
         return out
     i, end = 9, len(frame) - 3
+    while i < end:
+        n = frame[i]
+        if n == 0 or i + 1 + n > end:
+            break
+        if n == 2:
+            out[frame[i + 1]] = frame[i + 2]
+        i += 1 + n
+    if i == end:
+        return out
+    out = {}
+    i = 9
     while i + 3 <= end:
         if frame[i] == 0x02:
             out[frame[i + 1]] = frame[i + 2]

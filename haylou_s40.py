@@ -5,12 +5,15 @@ auriculares mientras siguen conectados como audio normal.
 """
 import asyncio
 import atexit
+import base64
 import ctypes
 import faulthandler
 import functools
+import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import sys
@@ -18,7 +21,7 @@ import threading
 import time
 import tkinter as tk
 import winreg
-from tkinter import ttk
+from tkinter import font as tkfont
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -40,20 +43,20 @@ MODE_NAMES = {P.ANC_NORMAL: "Off", P.ANC_ANC: "Cancelación de ruido (ANC)", P.A
 MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5E5CE6", P.ANC_TRANSP: "#30D158"}
 
 
-
 # ───────────────────────── configuración ─────────────────────────
 _crash_fh = None
 
 
-def setup_logging():
-    """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola."""
+def setup_logging(debug=False):
+    """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola.
+    Con --debug se guardan también las tramas BLE, útil para investigar el protocolo."""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         h = logging.handlers.RotatingFileHandler(os.path.join(APP_DIR, "haylou.log"),
                                                  maxBytes=200_000, backupCount=1, encoding="utf-8")
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(h)
-        log.setLevel(logging.INFO)
+        log.setLevel(logging.DEBUG if debug else logging.INFO)
     except Exception:
         pass
     try:  # si el proceso muere de golpe (fallo nativo), deja la traza en haylou-crash.log
@@ -179,7 +182,8 @@ class Headset:
         self.client = None
         self.run = True
         self.active = False  # ventana visible
-        threading.Thread(target=self._thread, daemon=True).start()
+        self.thread = threading.Thread(target=self._thread, name="ble", daemon=True)
+        self.thread.start()
 
     def _thread(self):
         asyncio.set_event_loop(self.loop)
@@ -192,9 +196,13 @@ class Headset:
         except RuntimeError:
             pass
 
-    def stop(self):
+    def stop(self, timeout=3.0):
+        """Pide al hilo BLE que suelte la conexión y lo espera un momento: así la sesión de
+        control queda libre enseguida para la app del celular."""
         self.run = False
+        self.on_change = None  # la UI está cerrándose: no despertarla desde este hilo
         self.send("quit")
+        self.thread.join(timeout)
 
     # --- internos ---
     def _changed(self):
@@ -212,6 +220,7 @@ class Headset:
 
     def _on_notify(self, _, data):
         b = bytes(data)
+        log.debug("<- %s", b.hex())
         pct = P.parse_battery(b)
         if pct is not None:
             self.state["battery"] = pct
@@ -249,16 +258,17 @@ class Headset:
         if dev is None:
             self._status("No encuentro los auriculares. ¿Están encendidos y conectados?", False)
             return False
-        client = None
         names = set()
         for fresh in (False, True):  # 2.º intento: sin la caché de servicios de Windows
             client = BleakClient(dev, timeout=15.0, disconnected_callback=self._on_disconnect,
                                  winrt={"use_cached_services": False} if fresh else {})
+            # se guarda antes de conectar: si algo falla a mitad, _drop() lo desconecta
+            self.client = client
             await client.connect()
             names = {c.uuid.lower() for s in client.services for c in s.characteristics}
             if P.SVC_WRITE in names:
                 break
-            await client.disconnect()
+            await self._drop()
             await asyncio.sleep(1.5)
         if P.SVC_WRITE not in names:
             self._status("Los auriculares no responden. ¿Hay otra app (o el celular) controlándolos?", False)
@@ -266,7 +276,6 @@ class Headset:
         for uuid in P.SVC_NOTIFY:
             if uuid in names:
                 await client.start_notify(uuid, self._on_notify)
-        self.client = client
         if self.cfg.get("addr") != dev.address:
             self.cfg["addr"] = dev.address
             save_config(self.cfg)
@@ -278,6 +287,7 @@ class Headset:
         return self.client is not None and self.client.is_connected
 
     async def _write(self, frame):
+        log.debug("-> %s", frame.hex())
         await self.client.write_gatt_char(P.SVC_WRITE, frame, response=False)
 
     async def _refresh(self, battery=True):
@@ -408,11 +418,6 @@ def app_icon_path():
 # Un solo Canvas dibujado a mano: formas suaves (PIL, cacheadas), resortes críticamente
 # amortiguados para los selectores, los interruptores y la barra. Solo se anima
 # mientras algo se mueve; en reposo la app apenas consume.
-import base64
-import io
-import math
-from tkinter import font as tkfont
-
 PALETTES = {
     "light": dict(bg="#F2F2F7", card="#FFFFFF", text="#1D1D1F", dim="#6E6E73", track="#E3E3E8",
                   thumb="#FFFFFF", hair="#E5E5EA", off="#D1D1D6", accent="#007AFF",
@@ -597,8 +602,7 @@ class App:
             ev = k32.CreateEventW(None, False, False, SHOW_EVENT)
             k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             while ev and k32.WaitForSingleObject(ev, 0xFFFFFFFF) == 0:
-                self.ui_q.put("show")
-                self.wake()
+                self.post("show")
         except Exception:
             log.exception("Falló el aviso entre copias")
 
@@ -921,6 +925,8 @@ class App:
 
     # --- acciones ---
     def set_value(self, key, v):
+        if not self.hs.state["connected"]:
+            return
         self.touched[key] = time.time()
         self.hs.state[key] = v
         self.hs.send(key, v)
@@ -946,17 +952,23 @@ class App:
 
     def _menu(self):
         def mode_item(m):
-            return pystray.MenuItem(MODE_NAMES[m], lambda *_: self.ui_q.put(f"mode:{m}"),
-                                    checked=lambda _i, m=m: self.hs.state.get("anc") == m, radio=True)
+            return pystray.MenuItem(MODE_NAMES[m], lambda *_: self.post(f"mode:{m}"),
+                                    checked=lambda _i, m=m: self.hs.state.get("anc") == m, radio=True,
+                                    enabled=lambda _i: self.hs.state["connected"])
         return pystray.Menu(
-            pystray.MenuItem("Abrir", lambda *_: self.ui_q.put("show"), default=True),
+            pystray.MenuItem("Abrir", lambda *_: self.post("show"), default=True),
             pystray.Menu.SEPARATOR,
             *[mode_item(m) for m in SEGMENTS["anc"]["values"]],
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Avisar de batería baja", self._toggle_lowbatt,
                              checked=lambda _i: self.hs.cfg.get("low_batt_notify", True)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Salir", lambda *_: self.ui_q.put("quit")))
+            pystray.MenuItem("Salir", lambda *_: self.post("quit")))
+
+    def post(self, cmd):
+        """Encola una orden para la UI (desde la bandeja u otro hilo) y la despierta."""
+        self.ui_q.put(cmd)
+        self.wake()
 
     def wake(self):
         """Despierta el ciclo de la UI desde otro hilo (BLE o bandeja)."""
@@ -1016,6 +1028,7 @@ class App:
         self.draw()
 
     def quit(self):
+        self.wake_ok = False
         try:
             self.tray.stop()
         except Exception:
@@ -1085,7 +1098,7 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    setup_logging()
+    setup_logging(debug="--debug" in sys.argv)
     if not single_instance(signal_existing="--bandeja" not in sys.argv):
         log.info("Ya hay otra copia abierta; se cierra esta")
         sys.exit(0)
