@@ -38,6 +38,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SHOW_EVENT = "HaylouS40_Show"  # una 2.ª copia lo activa para traer al frente la ventana ya abierta
 
 log = logging.getLogger("haylou")
+DEBUG = "--debug" in sys.argv  # sin --debug no se formatea ninguna trama BLE
 log.addHandler(logging.NullHandler())
 
 MODE_NAMES = {P.ANC_NORMAL: "Off", P.ANC_ANC: "Cancelación de ruido (ANC)", P.ANC_ADAPTIVE: "ANC adaptativo", P.ANC_TRANSP: "Sonido ambiente"}
@@ -223,7 +224,8 @@ class Headset:
 
     def _on_notify(self, _, data):
         b = bytes(data)
-        log.debug("<- %s", b.hex())
+        if DEBUG:
+            log.debug("<- %s", b.hex())
         pct = P.parse_battery(b)
         if pct is not None:
             self.state["battery"] = pct
@@ -294,7 +296,8 @@ class Headset:
         return self.client is not None and self.client.is_connected
 
     async def _write(self, frame):
-        log.debug("-> %s", frame.hex())
+        if DEBUG:
+            log.debug("-> %s", frame.hex())
         await self.client.write_gatt_char(P.SVC_WRITE, frame, response=False)
 
     async def _refresh(self, battery=True):
@@ -483,27 +486,34 @@ def reduce_motion() -> bool:
     return _rm_cache[1]
 
 
+@functools.lru_cache(maxsize=1)
+def _monitor_api():
+    """Funciones de monitores de Windows, preparadas una sola vez."""
+    u = ctypes.windll.user32
+    u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    u.MonitorFromPoint.restype = ctypes.c_void_p
+    u.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    u.MonitorFromWindow.restype = ctypes.c_void_p
+    return u, ctypes.windll.shcore.GetDpiForMonitor
+
+
 def on_screen(x, y) -> bool:
     """¿El punto (píxeles físicos) cae en algún monitor conectado?"""
     try:
-        u = ctypes.windll.user32
-        u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
-        u.MonitorFromPoint.restype = ctypes.c_void_p
+        u, _ = _monitor_api()
         return bool(u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 0))  # MONITOR_DEFAULTTONULL
     except Exception:
         return True
 
 
 def window_scale(hwnd):
-    """Escala (DPI / 96) del monitor donde está la ventana, o None si no se puede saber."""
+    """Escala (DPI / 96) del monitor donde está la ventana, o None si no se puede saber.
+    Es una consulta directa al sistema (microsegundos) y solo se hace con la ventana visible."""
     try:
-        u = ctypes.windll.user32
-        u.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-        u.MonitorFromWindow.restype = ctypes.c_void_p
+        u, get_dpi = _monitor_api()
         mon = u.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
         dx, dy = ctypes.c_uint(), ctypes.c_uint()
-        if mon and ctypes.windll.shcore.GetDpiForMonitor(ctypes.c_void_p(mon), 0, ctypes.byref(dx),
-                                                          ctypes.byref(dy)) == 0 and dx.value:
+        if mon and get_dpi(ctypes.c_void_p(mon), 0, ctypes.byref(dx), ctypes.byref(dy)) == 0 and dx.value:
             return dx.value / 96.0
     except Exception:
         log.debug("No se pudo leer el DPI del monitor", exc_info=True)
@@ -1187,7 +1197,7 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    setup_logging(debug="--debug" in sys.argv)
+    setup_logging(debug=DEBUG)
     if not single_instance(signal_existing="--bandeja" not in sys.argv):
         log.info("Ya hay otra copia abierta; se cierra esta")
         sys.exit(0)
