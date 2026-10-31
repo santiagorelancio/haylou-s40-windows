@@ -25,6 +25,11 @@ SPATIAL_DYNAMIC, SPATIAL_STATIC, SPATIAL_OFF = 0, 1, 2
 # Escenario espacial (igual en dinámico y estático): 0 = Música, 1 = Ejercicio, 2 = Película
 SCENE_MUSIC, SCENE_EXERCISE, SCENE_MOVIE = 0, 1, 2
 
+# Aviso espontáneo (op 0x0e) que manda el auricular al pulsar el botón físico:
+# aabbcc c0 0e 0004 <sn> 02 08 <modo> ddeeff, con <modo> en los mismos valores que ANC_*.
+OP_EVENT = 0x0E
+EVT_ANC = 0x08
+
 
 def _frame(kind: int, op: int, body: bytes, sn: int) -> bytes:
     n = len(body) + 1
@@ -56,12 +61,42 @@ def parse_battery(frame: bytes):
     return None
 
 
+def _tlv(frame: bytes, start: int):
+    """Campos de un byte de una lista TLV (<largo> <id> <datos>) hasta el pie.
+    Devuelve (campos, encajó_exacto)."""
+    out, i, end = {}, start, len(frame) - 3
+    while i < end:
+        n = frame[i]
+        if n == 0 or i + 1 + n > end:
+            break
+        if n == 2:
+            out[frame[i + 1]] = frame[i + 2]
+        i += 1 + n
+    return out, i == end
+
+
+def parse_event(frame: bytes) -> dict:
+    """Aviso espontáneo del auricular (op 0x0e) -> {id: valor}; {} si no lo es."""
+    if not (is_valid(frame) and frame[4] == OP_EVENT):
+        return {}
+    out, ok = _tlv(frame, 8)
+    return out if ok else {}
+
+
 def parse_run_info(frame: bytes) -> dict:
-    """Respuesta de GET_RUN_INFO -> {ordinal: valor}. Valor 0xff = no disponible."""
-    out = {}
+    """Respuesta de GET_RUN_INFO -> {ordinal: valor}. Valor 0xff = no disponible.
+
+    El cuerpo es una lista TLV: <largo> <ordinal> <datos (largo-1 bytes)>. Solo se
+    devuelven los campos de un byte (largo 2), que son los ajustes. Recorrerlo como
+    TLV evita confundir un 0x02 dentro de la dirección del dispositivo con el
+    inicio de un campo. Si la trama no encaja como TLV, se usa la búsqueda de
+    tripletas «02 ord valor» como respaldo."""
     if not (is_valid(frame) and frame[4] == 0x09):
+        return {}
+    out, ok = _tlv(frame, 9)
+    if ok:
         return out
-    i, end = 9, len(frame) - 3
+    out, i, end = {}, 9, len(frame) - 3
     while i + 3 <= end:
         if frame[i] == 0x02:
             out[frame[i + 1]] = frame[i + 2]

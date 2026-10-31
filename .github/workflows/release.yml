@@ -2,6 +2,7 @@ name: Publicar instalable
 
 # Genera el .zip portable (sin necesidad de instalar Python) y lo adjunta a una Release.
 # Se ejecuta al subir una etiqueta "v*" o a mano desde la pestaña Actions.
+# Firma: si existen los secretos SIGN_CERT_PFX_BASE64 y SIGN_CERT_PASSWORD, el .exe se firma.
 on:
   push:
     tags: ["v*"]
@@ -25,30 +26,18 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
+      - name: Instalar dependencias (versiones fijadas)
+        run: python -m pip install -r requirements-lock.txt
 
       - name: Pruebas del protocolo
         run: python test_protocol.py
 
-      - name: Generar icono
-        run: python make_icon.py
-
-      - name: Empaquetar con PyInstaller
+      - name: Empaquetar (y firmar si hay certificado)
         shell: pwsh
-        run: |
-          py -m PyInstaller --noconfirm --clean --onedir --windowed --name "Haylou S40" `
-            --icon icon.ico --add-data "icon.ico;." `
-            --add-data "tcl_stub;_tcl_data" --add-data "tcl_stub;_tk_data" --runtime-hook rthook_tcl9.py `
-            --paths . --collect-submodules bleak --collect-all winrt `
-            --hidden-import pystray._win32 `
-            --exclude-module flet --exclude-module numpy --exclude-module pycaw `
-            haylou_s40.py
-          if (-not (Test-Path "dist\Haylou S40\Haylou S40.exe")) { throw "Fallo el empaquetado" }
-
-      - name: Comprimir
-        shell: pwsh
-        run: Compress-Archive -Path "dist\Haylou S40" -DestinationPath "Haylou-S40-Windows.zip"
+        env:
+          SIGN_CERT_PFX_BASE64: ${{ secrets.SIGN_CERT_PFX_BASE64 }}
+          SIGN_CERT_PASSWORD: ${{ secrets.SIGN_CERT_PASSWORD }}
+        run: ./build.ps1 -NoInstall -DistDir dist -Zip -Python python
 
       - name: Publicar release
         shell: pwsh
@@ -58,4 +47,4 @@ jobs:
         run: |
           gh release create $env:VERSION Haylou-S40-Windows.zip `
             --title "Haylou S40 para Windows $env:VERSION" `
-            --notes "Descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No hace falta instalar Python. Windows puede mostrar un aviso de SmartScreen porque el programa no está firmado: pulsa «Más información» y «Ejecutar de todas formas»."
+            --notes "Descarga **Haylou-S40-Windows.zip**, descomprímelo y abre **Haylou S40.exe**. No hace falta instalar Python. Si el programa no está firmado, Windows puede mostrar un aviso de SmartScreen: pulsa «Más información» y «Ejecutar de todas formas»."

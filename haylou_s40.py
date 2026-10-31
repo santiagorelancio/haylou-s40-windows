@@ -5,12 +5,15 @@ auriculares mientras siguen conectados como audio normal.
 """
 import asyncio
 import atexit
+import base64
 import ctypes
 import faulthandler
 import functools
+import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import sys
@@ -18,7 +21,8 @@ import threading
 import time
 import tkinter as tk
 import winreg
-from tkinter import ttk
+from ctypes import wintypes
+from tkinter import font as tkfont
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -34,26 +38,28 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SHOW_EVENT = "HaylouS40_Show"  # una 2.ª copia lo activa para traer al frente la ventana ya abierta
 
 log = logging.getLogger("haylou")
+DEBUG = "--debug" in sys.argv  # sin --debug no se formatea ninguna trama BLE
 log.addHandler(logging.NullHandler())
 
 MODE_NAMES = {P.ANC_NORMAL: "Off", P.ANC_ANC: "Cancelación de ruido (ANC)", P.ANC_ADAPTIVE: "ANC adaptativo", P.ANC_TRANSP: "Sonido ambiente"}
 MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5E5CE6", P.ANC_TRANSP: "#30D158"}
 
 
-
 # ───────────────────────── configuración ─────────────────────────
 _crash_fh = None
+_cfg_lock = threading.Lock()
 
 
-def setup_logging():
-    """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola."""
+def setup_logging(debug=False):
+    """Registro en %APPDATA%\\HaylouS40\\haylou.log (rotativo): la app no tiene consola.
+    Con --debug se guardan también las tramas BLE, útil para investigar el protocolo."""
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         h = logging.handlers.RotatingFileHandler(os.path.join(APP_DIR, "haylou.log"),
                                                  maxBytes=200_000, backupCount=1, encoding="utf-8")
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(h)
-        log.setLevel(logging.INFO)
+        log.setLevel(logging.DEBUG if debug else logging.INFO)
     except Exception:
         pass
     try:  # si el proceso muere de golpe (fallo nativo), deja la traza en haylou-crash.log
@@ -82,11 +88,12 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f)
-        os.replace(tmp, CONFIG_PATH)  # escritura atómica: nunca queda a medias
+        with _cfg_lock:  # se guarda desde varios hilos (BLE, interfaz, bandeja)
+            os.makedirs(APP_DIR, exist_ok=True)
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg), f)
+            os.replace(tmp, CONFIG_PATH)  # escritura atómica: nunca queda a medias
     except Exception:
         log.exception("No se pudo guardar la configuración")
 
@@ -179,7 +186,8 @@ class Headset:
         self.client = None
         self.run = True
         self.active = False  # ventana visible
-        threading.Thread(target=self._thread, daemon=True).start()
+        self.thread = threading.Thread(target=self._thread, name="ble", daemon=True)
+        self.thread.start()
 
     def _thread(self):
         asyncio.set_event_loop(self.loop)
@@ -192,9 +200,13 @@ class Headset:
         except RuntimeError:
             pass
 
-    def stop(self):
+    def stop(self, timeout=3.0):
+        """Pide al hilo BLE que suelte la conexión y lo espera un momento: así la sesión de
+        control queda libre enseguida para la app del celular."""
         self.run = False
+        self.on_change = None  # la UI está cerrándose: no despertarla desde este hilo
         self.send("quit")
+        self.thread.join(timeout)
 
     # --- internos ---
     def _changed(self):
@@ -212,6 +224,8 @@ class Headset:
 
     def _on_notify(self, _, data):
         b = bytes(data)
+        if DEBUG:
+            log.debug("<- %s", b.hex())
         pct = P.parse_battery(b)
         if pct is not None:
             self.state["battery"] = pct
@@ -224,7 +238,11 @@ class Headset:
                 if v is not None and v != 0xFF:
                     self.state[key] = v
         elif pct is None and P.is_valid(b) and b[4] not in (0x02, 0x08, 0x09):
-            # aviso espontáneo (p. ej. botón físico): pedimos el estado completo
+            # aviso espontáneo (p. ej. botón físico): el modo de ruido viene en el aviso y se
+            # muestra ya; igualmente pedimos el estado completo para confirmarlo
+            mode = P.parse_event(b).get(P.EVT_ANC)
+            if mode in MODE_NAMES:
+                self.state["anc"] = mode
             self.send("refresh")
         self._changed()
 
@@ -249,16 +267,17 @@ class Headset:
         if dev is None:
             self._status("No encuentro los auriculares. ¿Están encendidos y conectados?", False)
             return False
-        client = None
         names = set()
         for fresh in (False, True):  # 2.º intento: sin la caché de servicios de Windows
             client = BleakClient(dev, timeout=15.0, disconnected_callback=self._on_disconnect,
                                  winrt={"use_cached_services": False} if fresh else {})
+            # se guarda antes de conectar: si algo falla a mitad, _drop() lo desconecta
+            self.client = client
             await client.connect()
             names = {c.uuid.lower() for s in client.services for c in s.characteristics}
             if P.SVC_WRITE in names:
                 break
-            await client.disconnect()
+            await self._drop()
             await asyncio.sleep(1.5)
         if P.SVC_WRITE not in names:
             self._status("Los auriculares no responden. ¿Hay otra app (o el celular) controlándolos?", False)
@@ -266,7 +285,6 @@ class Headset:
         for uuid in P.SVC_NOTIFY:
             if uuid in names:
                 await client.start_notify(uuid, self._on_notify)
-        self.client = client
         if self.cfg.get("addr") != dev.address:
             self.cfg["addr"] = dev.address
             save_config(self.cfg)
@@ -278,6 +296,8 @@ class Headset:
         return self.client is not None and self.client.is_connected
 
     async def _write(self, frame):
+        if DEBUG:
+            log.debug("-> %s", frame.hex())
         await self.client.write_gatt_char(P.SVC_WRITE, frame, response=False)
 
     async def _refresh(self, battery=True):
@@ -408,11 +428,6 @@ def app_icon_path():
 # Un solo Canvas dibujado a mano: formas suaves (PIL, cacheadas), resortes críticamente
 # amortiguados para los selectores, los interruptores y la barra. Solo se anima
 # mientras algo se mueve; en reposo la app apenas consume.
-import base64
-import io
-import math
-from tkinter import font as tkfont
-
 PALETTES = {
     "light": dict(bg="#F2F2F7", card="#FFFFFF", text="#1D1D1F", dim="#6E6E73", track="#E3E3E8",
                   thumb="#FFFFFF", hair="#E5E5EA", off="#D1D1D6", accent="#007AFF",
@@ -469,6 +484,40 @@ def reduce_motion() -> bool:
         ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(on), 0)
         _rm_cache = (now, not on.value)
     return _rm_cache[1]
+
+
+@functools.lru_cache(maxsize=1)
+def _monitor_api():
+    """Funciones de monitores de Windows, preparadas una sola vez."""
+    u = ctypes.windll.user32
+    u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    u.MonitorFromPoint.restype = ctypes.c_void_p
+    u.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    u.MonitorFromWindow.restype = ctypes.c_void_p
+    return u, ctypes.windll.shcore.GetDpiForMonitor
+
+
+def on_screen(x, y) -> bool:
+    """¿El punto (píxeles físicos) cae en algún monitor conectado?"""
+    try:
+        u, _ = _monitor_api()
+        return bool(u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 0))  # MONITOR_DEFAULTTONULL
+    except Exception:
+        return True
+
+
+def window_scale(hwnd):
+    """Escala (DPI / 96) del monitor donde está la ventana, o None si no se puede saber.
+    Es una consulta directa al sistema (microsegundos) y solo se hace con la ventana visible."""
+    try:
+        u, get_dpi = _monitor_api()
+        mon = u.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        dx, dy = ctypes.c_uint(), ctypes.c_uint()
+        if mon and get_dpi(ctypes.c_void_p(mon), 0, ctypes.byref(dx), ctypes.byref(dy)) == 0 and dx.value:
+            return dx.value / 96.0
+    except Exception:
+        log.debug("No se pudo leer el DPI del monitor", exc_info=True)
+    return None
 
 
 def set_eco_mode(on: bool):
@@ -536,6 +585,9 @@ class App:
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
         self.root.resizable(False, False)
+        pos = self.hs.cfg.get("pos")
+        if isinstance(pos, list) and len(pos) == 2 and self._pos_ok(*pos):
+            self.root.geometry(f"+{int(pos[0])}+{int(pos[1])}")
         log.info("Ventana creada (barra propia: %s)", self.chrome)
 
         fams = set(tkfont.families())
@@ -570,6 +622,7 @@ class App:
         self.f_big = tkfont.Font(family=self.fam_l, size=-self.px(52))
         self.root.update_idletasks()
         self.apply_theme()
+        self.check_scale()
 
         self.tray = pystray.Icon("HaylouS40", make_icon(None, None, False), APP_NAME, self._menu())
         self.tray.run_detached()
@@ -597,8 +650,7 @@ class App:
             ev = k32.CreateEventW(None, False, False, SHOW_EVENT)
             k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             while ev and k32.WaitForSingleObject(ev, 0xFFFFFFFF) == 0:
-                self.ui_q.put("show")
-                self.wake()
+                self.post("show")
         except Exception:
             log.exception("Falló el aviso entre copias")
 
@@ -628,6 +680,50 @@ class App:
                 u.SetWindowLongW(hwnd, -20, new)
         except Exception:
             log.debug("No se pudo fijar el estilo de ventana", exc_info=True)
+
+    # --- posición y escala por monitor ---
+    def hwnd(self):
+        return ctypes.windll.user32.GetParent(self.root.winfo_id())
+
+    def _pos_ok(self, x, y):
+        """La zona de la barra superior queda dentro de algún monitor (para poder arrastrarla)."""
+        return on_screen(x + self.px(60), y + self.px(10)) and on_screen(x + self.px(W - 60), y + self.px(10))
+
+    def ensure_on_screen(self):
+        """Si la ventana quedó fuera de pantalla (p. ej. se desconectó un monitor), la centra
+        en el principal."""
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        if not self._pos_ok(x, y):
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            w, h = self.px(W), self.px(H + self.dy)
+            self.root.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+            log.info("Ventana fuera de pantalla: se recoloca")
+
+    def save_pos(self):
+        pos = [self.root.winfo_x(), self.root.winfo_y()]
+        if self.hs.cfg.get("pos") != pos:
+            self.hs.cfg["pos"] = pos
+            save_config(self.hs.cfg)
+
+    def check_scale(self):
+        """Tk no reacciona al cambio de DPI entre monitores: si la ventana pasa a un monitor con
+        otra escala, se recalcula todo (está dibujado en píxeles a partir de self.k)."""
+        try:
+            k = window_scale(self.hwnd())
+        except Exception:
+            k = None
+        if not k or abs(k - self.k) < 0.01:
+            return
+        log.info("Cambio de escala: %.2f -> %.2f", self.k, k)
+        self.k = k
+        self.imgs.clear()
+        self.f_big.configure(size=-self.px(52))
+        w, h = self.px(W), self.px(H + self.dy)
+        self.cv.configure(width=w, height=h)
+        self.root.geometry(f"{w}x{h}")
+        self._sig = None
+        if self._visible:
+            self.draw()
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -886,7 +982,11 @@ class App:
             self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
     def on_release(self, e):
-        self._drag = None
+        if self._drag:
+            self._drag = None
+            self.save_pos()
+            self.check_scale()
+            return
         ident, fn = self.hit(e)
         was, self.pressed = self.pressed, None
         if ident and ident == was:
@@ -921,6 +1021,8 @@ class App:
 
     # --- acciones ---
     def set_value(self, key, v):
+        if not self.hs.state["connected"]:
+            return
         self.touched[key] = time.time()
         self.hs.state[key] = v
         self.hs.send(key, v)
@@ -946,17 +1048,23 @@ class App:
 
     def _menu(self):
         def mode_item(m):
-            return pystray.MenuItem(MODE_NAMES[m], lambda *_: self.ui_q.put(f"mode:{m}"),
-                                    checked=lambda _i, m=m: self.hs.state.get("anc") == m, radio=True)
+            return pystray.MenuItem(MODE_NAMES[m], lambda *_: self.post(f"mode:{m}"),
+                                    checked=lambda _i, m=m: self.hs.state.get("anc") == m, radio=True,
+                                    enabled=lambda _i: self.hs.state["connected"])
         return pystray.Menu(
-            pystray.MenuItem("Abrir", lambda *_: self.ui_q.put("show"), default=True),
+            pystray.MenuItem("Abrir", lambda *_: self.post("show"), default=True),
             pystray.Menu.SEPARATOR,
             *[mode_item(m) for m in SEGMENTS["anc"]["values"]],
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Avisar de batería baja", self._toggle_lowbatt,
                              checked=lambda _i: self.hs.cfg.get("low_batt_notify", True)),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Salir", lambda *_: self.ui_q.put("quit")))
+            pystray.MenuItem("Salir", lambda *_: self.post("quit")))
+
+    def post(self, cmd):
+        """Encola una orden para la UI (desde la bandeja u otro hilo) y la despierta."""
+        self.ui_q.put(cmd)
+        self.wake()
 
     def wake(self):
         """Despierta el ciclo de la UI desde otro hilo (BLE o bandeja)."""
@@ -1008,7 +1116,9 @@ class App:
 
     def show(self):
         self._appwindow()
+        self.ensure_on_screen()
         self.root.deiconify()
+        self.check_scale()
         self.root.lift()
         self.root.focus_force()
         self._set_visible(True)
@@ -1016,6 +1126,7 @@ class App:
         self.draw()
 
     def quit(self):
+        self.wake_ok = False
         try:
             self.tray.stop()
         except Exception:
@@ -1065,6 +1176,7 @@ class App:
                     self.theme = th
                     self.apply_theme()
                     self._sig = None
+                self.check_scale()
             self.sync()
             sig = (tuple(sorted(s.items())), self.auto, self.theme)
             if sig != self._sig and not self.running:  # solo redibuja si algo cambió
@@ -1085,7 +1197,7 @@ if __name__ == "__main__":
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         pass
-    setup_logging()
+    setup_logging(debug=DEBUG)
     if not single_instance(signal_existing="--bandeja" not in sys.argv):
         log.info("Ya hay otra copia abierta; se cierra esta")
         sys.exit(0)

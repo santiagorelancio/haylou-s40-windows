@@ -1,0 +1,46 @@
+name: Pruebas
+
+# Las pruebas del protocolo son Python puro (sin Bluetooth), así que corren en Linux.
+# Después se genera el .zip de Windows para probarlo: queda en «Artifacts» de cada ejecución
+# (no se publica ninguna release).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  protocolo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Pruebas del protocolo
+        run: python test_protocol.py
+      - name: Análisis estático
+        run: |
+          pip install pyflakes
+          python -m pyflakes haylou_s40.py s40_protocol.py test_protocol.py make_icon.py rthook_tcl9.py
+
+  paquete:
+    needs: protocolo
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Instalar dependencias (versiones fijadas)
+        run: python -m pip install -r requirements-lock.txt
+      - name: Empaquetar
+        shell: pwsh
+        env:
+          SIGN_CERT_PFX_BASE64: ${{ secrets.SIGN_CERT_PFX_BASE64 }}
+          SIGN_CERT_PASSWORD: ${{ secrets.SIGN_CERT_PASSWORD }}
+        run: ./build.ps1 -NoInstall -DistDir dist -Python python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Haylou-S40-Windows
+          path: dist/
+          retention-days: 14

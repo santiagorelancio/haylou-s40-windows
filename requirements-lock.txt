@@ -1,0 +1,24 @@
+# Versiones exactas para generar el instalable de Windows (Python 3.14) de forma reproducible.
+# Se regenera desde requirements.txt con:
+#   uv pip compile requirements.txt --python-platform windows --python-version 3.14 --no-header --annotation-style line -o requirements-lock.txt
+altgraph==0.17.5          # via pyinstaller
+bleak==3.0.2              # via -r requirements.txt
+packaging==26.3           # via pyinstaller, pyinstaller-hooks-contrib
+pefile==2024.8.26         # via pyinstaller
+pillow==13.0.0            # via pystray, -r requirements.txt
+pyinstaller==6.22.3       # via -r requirements.txt
+pyinstaller-hooks-contrib==2026.9  # via pyinstaller
+pystray==0.19.5           # via -r requirements.txt
+pywin32-ctypes==0.2.3     # via pyinstaller
+setuptools==84.2.1        # via pyinstaller
+six==1.17.0               # via pystray
+typing-extensions==4.16.0  # via winrt-runtime
+winrt-runtime==4.1.0      # via bleak, winrt-windows-devices-bluetooth, winrt-windows-devices-bluetooth-advertisement, winrt-windows-devices-bluetooth-genericattributeprofile, winrt-windows-devices-enumeration, winrt-windows-devices-radios, winrt-windows-foundation, winrt-windows-foundation-collections, winrt-windows-storage-streams
+winrt-windows-devices-bluetooth==4!10.0.28000.2705  # via bleak
+winrt-windows-devices-bluetooth-advertisement==4!10.0.28000.2705  # via bleak
+winrt-windows-devices-bluetooth-genericattributeprofile==4!10.0.28000.2705  # via bleak
+winrt-windows-devices-enumeration==4!10.0.28000.2705  # via bleak
+winrt-windows-devices-radios==4!10.0.28000.2705  # via bleak
+winrt-windows-foundation==4!10.0.28000.2705  # via bleak, winrt-windows-devices-bluetooth, winrt-windows-devices-bluetooth-advertisement, winrt-windows-devices-bluetooth-genericattributeprofile, winrt-windows-devices-enumeration, winrt-windows-devices-radios, winrt-windows-foundation-collections, winrt-windows-storage-streams
+winrt-windows-foundation-collections==4!10.0.28000.2705  # via bleak, winrt-windows-devices-bluetooth, winrt-windows-devices-bluetooth-advertisement, winrt-windows-devices-bluetooth-genericattributeprofile, winrt-windows-devices-enumeration, winrt-windows-devices-radios, winrt-windows-foundation, winrt-windows-storage-streams
+winrt-windows-storage-streams==4!10.0.28000.2705  # via bleak, winrt-windows-devices-bluetooth, winrt-windows-devices-bluetooth-advertisement, winrt-windows-devices-bluetooth-genericattributeprofile, winrt-windows-devices-enumeration

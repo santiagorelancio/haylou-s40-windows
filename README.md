@@ -17,6 +17,8 @@ Pequeña aplicación de escritorio, en español, para ver el estado y controlar 
 - Icono en la bandeja con el porcentaje de batería y el modo activo (clic derecho para cambiar de modo).
 - **Aviso de batería baja** (20 % y 10 %) como notificación de Windows; se activa o desactiva desde el menú de la bandeja.
 - Si abres la app otra vez mientras está en la bandeja, muestra la ventana ya abierta.
+- Recuerda dónde dejaste la ventana y se adapta si la mueves a un monitor con otra escala.
+- Los cambios hechos con el botón físico se ven al instante.
 - Tema claro/oscuro según Windows, animaciones suaves (respeta «reducir animaciones»), reconexión automática y opción de iniciar con Windows.
 
 Lo que **no** incluye: el EQ del auricular (los valores no coinciden con ningún nombre conocido), LDAC (Windows no usa ese códec y el cambio reinicia los auriculares) y los niveles de ANC (en las pruebas no produjeron ningún cambio medible). Detalles en [docs/PROTOCOLO-S40.md](docs/PROTOCOLO-S40.md).
@@ -45,11 +47,23 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 Empaqueta la app con PyInstaller, la instala para tu usuario en `%LOCALAPPDATA%\Programs\HaylouS40`, crea el acceso directo en el menú Inicio y un desinstalador (también aparece en «Aplicaciones» de Windows). No requiere permisos de administrador. Si no hay `icon.ico`, se genera un icono genérico; si pones tu propia imagen como `icon_source.jpg`, se usa esa.
 
+Para usar exactamente las mismas versiones que la release oficial: `pip install -r requirements-lock.txt`. Con `-NoInstall -DistDir dist -Zip` solo genera la carpeta y el `.zip` sin instalar nada (es lo que usan los workflows de GitHub). Cada push genera además el `.zip` de prueba en la pestaña **Actions** → ejecución de «Pruebas» → **Artifacts**.
+
+### Firmar el ejecutable (opcional)
+
+Si el repositorio tiene los secretos `SIGN_CERT_PFX_BASE64` (el certificado `.pfx` en base64) y `SIGN_CERT_PASSWORD`, los workflows firman `Haylou S40.exe` con `signtool` y sello de tiempo. En local: `build.ps1 -CertPath certificado.pfx -CertPassword ...`.
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("certificado.pfx")) | Set-Clipboard
+```
+
+Para que desaparezca el aviso de SmartScreen hace falta un certificado de firma de código emitido por una autoridad reconocida (p. ej. Azure Trusted Signing, o SignPath, gratuito para proyectos de código abierto); uno autofirmado no sirve. Aun firmado, SmartScreen puede avisar hasta que el programa gane reputación.
+
 ## Cosas que conviene saber
 
 - **Solo un dispositivo puede controlar los auriculares a la vez.** Si la app oficial del celular (o una segunda copia de esta app) está conectada, los auriculares esconden sus servicios de control y esta app mostrará que no responden. Cierra la otra app y pulsa «Reconectar». Con el **multipunto** activado el celular puede conectarse a la vez para el audio.
 - La primera conexión puede tardar entre 10 y 20 segundos.
-- Si algo falla, el registro está en `%APPDATA%\HaylouS40\haylou.log`.
+- Si algo falla, el registro está en `%APPDATA%\HaylouS40\haylou.log`. Arrancando con `--debug` (`python haylou_s40.py --debug`) se guardan también las tramas BLE enviadas y recibidas.
 - La app habla con los auriculares por Bluetooth LE mientras siguen conectados como audio normal; no cambia nada del audio de Windows.
 
 ## Cómo funciona
