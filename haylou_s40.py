@@ -21,6 +21,7 @@ import threading
 import time
 import tkinter as tk
 import winreg
+from ctypes import wintypes
 from tkinter import font as tkfont
 
 from bleak import BleakClient, BleakScanner
@@ -45,6 +46,7 @@ MODE_COLOR = {P.ANC_NORMAL: "#8E8E93", P.ANC_ANC: "#0A84FF", P.ANC_ADAPTIVE: "#5
 
 # ───────────────────────── configuración ─────────────────────────
 _crash_fh = None
+_cfg_lock = threading.Lock()
 
 
 def setup_logging(debug=False):
@@ -85,11 +87,12 @@ def load_config() -> dict:
 
 def save_config(cfg: dict):
     try:
-        os.makedirs(APP_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f)
-        os.replace(tmp, CONFIG_PATH)  # escritura atómica: nunca queda a medias
+        with _cfg_lock:  # se guarda desde varios hilos (BLE, interfaz, bandeja)
+            os.makedirs(APP_DIR, exist_ok=True)
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg), f)
+            os.replace(tmp, CONFIG_PATH)  # escritura atómica: nunca queda a medias
     except Exception:
         log.exception("No se pudo guardar la configuración")
 
@@ -233,7 +236,11 @@ class Headset:
                 if v is not None and v != 0xFF:
                     self.state[key] = v
         elif pct is None and P.is_valid(b) and b[4] not in (0x02, 0x08, 0x09):
-            # aviso espontáneo (p. ej. botón físico): pedimos el estado completo
+            # aviso espontáneo (p. ej. botón físico): el modo de ruido viene en el aviso y se
+            # muestra ya; igualmente pedimos el estado completo para confirmarlo
+            mode = P.parse_event(b).get(P.EVT_ANC)
+            if mode in MODE_NAMES:
+                self.state["anc"] = mode
             self.send("refresh")
         self._changed()
 
@@ -476,6 +483,33 @@ def reduce_motion() -> bool:
     return _rm_cache[1]
 
 
+def on_screen(x, y) -> bool:
+    """¿El punto (píxeles físicos) cae en algún monitor conectado?"""
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        u.MonitorFromPoint.restype = ctypes.c_void_p
+        return bool(u.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 0))  # MONITOR_DEFAULTTONULL
+    except Exception:
+        return True
+
+
+def window_scale(hwnd):
+    """Escala (DPI / 96) del monitor donde está la ventana, o None si no se puede saber."""
+    try:
+        u = ctypes.windll.user32
+        u.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        u.MonitorFromWindow.restype = ctypes.c_void_p
+        mon = u.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        dx, dy = ctypes.c_uint(), ctypes.c_uint()
+        if mon and ctypes.windll.shcore.GetDpiForMonitor(ctypes.c_void_p(mon), 0, ctypes.byref(dx),
+                                                          ctypes.byref(dy)) == 0 and dx.value:
+            return dx.value / 96.0
+    except Exception:
+        log.debug("No se pudo leer el DPI del monitor", exc_info=True)
+    return None
+
+
 def set_eco_mode(on: bool):
     """Oculta -> prioridad mínima y «modo eficiencia» (EcoQoS) de Windows; visible -> normal."""
     try:
@@ -541,6 +575,9 @@ class App:
         self.dy = TOP_BAR if self.chrome else 0
         self.root.geometry(f"{self.px(W)}x{self.px(H + self.dy)}")
         self.root.resizable(False, False)
+        pos = self.hs.cfg.get("pos")
+        if isinstance(pos, list) and len(pos) == 2 and self._pos_ok(*pos):
+            self.root.geometry(f"+{int(pos[0])}+{int(pos[1])}")
         log.info("Ventana creada (barra propia: %s)", self.chrome)
 
         fams = set(tkfont.families())
@@ -575,6 +612,7 @@ class App:
         self.f_big = tkfont.Font(family=self.fam_l, size=-self.px(52))
         self.root.update_idletasks()
         self.apply_theme()
+        self.check_scale()
 
         self.tray = pystray.Icon("HaylouS40", make_icon(None, None, False), APP_NAME, self._menu())
         self.tray.run_detached()
@@ -632,6 +670,50 @@ class App:
                 u.SetWindowLongW(hwnd, -20, new)
         except Exception:
             log.debug("No se pudo fijar el estilo de ventana", exc_info=True)
+
+    # --- posición y escala por monitor ---
+    def hwnd(self):
+        return ctypes.windll.user32.GetParent(self.root.winfo_id())
+
+    def _pos_ok(self, x, y):
+        """La zona de la barra superior queda dentro de algún monitor (para poder arrastrarla)."""
+        return on_screen(x + self.px(60), y + self.px(10)) and on_screen(x + self.px(W - 60), y + self.px(10))
+
+    def ensure_on_screen(self):
+        """Si la ventana quedó fuera de pantalla (p. ej. se desconectó un monitor), la centra
+        en el principal."""
+        x, y = self.root.winfo_x(), self.root.winfo_y()
+        if not self._pos_ok(x, y):
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            w, h = self.px(W), self.px(H + self.dy)
+            self.root.geometry(f"+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+            log.info("Ventana fuera de pantalla: se recoloca")
+
+    def save_pos(self):
+        pos = [self.root.winfo_x(), self.root.winfo_y()]
+        if self.hs.cfg.get("pos") != pos:
+            self.hs.cfg["pos"] = pos
+            save_config(self.hs.cfg)
+
+    def check_scale(self):
+        """Tk no reacciona al cambio de DPI entre monitores: si la ventana pasa a un monitor con
+        otra escala, se recalcula todo (está dibujado en píxeles a partir de self.k)."""
+        try:
+            k = window_scale(self.hwnd())
+        except Exception:
+            k = None
+        if not k or abs(k - self.k) < 0.01:
+            return
+        log.info("Cambio de escala: %.2f -> %.2f", self.k, k)
+        self.k = k
+        self.imgs.clear()
+        self.f_big.configure(size=-self.px(52))
+        w, h = self.px(W), self.px(H + self.dy)
+        self.cv.configure(width=w, height=h)
+        self.root.geometry(f"{w}x{h}")
+        self._sig = None
+        if self._visible:
+            self.draw()
 
     # --- utilidades de dibujo ---
     def px(self, v):
@@ -890,7 +972,11 @@ class App:
             self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
     def on_release(self, e):
-        self._drag = None
+        if self._drag:
+            self._drag = None
+            self.save_pos()
+            self.check_scale()
+            return
         ident, fn = self.hit(e)
         was, self.pressed = self.pressed, None
         if ident and ident == was:
@@ -1020,7 +1106,9 @@ class App:
 
     def show(self):
         self._appwindow()
+        self.ensure_on_screen()
         self.root.deiconify()
+        self.check_scale()
         self.root.lift()
         self.root.focus_force()
         self._set_visible(True)
@@ -1078,6 +1166,7 @@ class App:
                     self.theme = th
                     self.apply_theme()
                     self._sig = None
+                self.check_scale()
             self.sync()
             sig = (tuple(sorted(s.items())), self.auto, self.theme)
             if sig != self._sig and not self.running:  # solo redibuja si algo cambió

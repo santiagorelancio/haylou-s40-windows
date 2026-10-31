@@ -1,32 +1,85 @@
-# Empaqueta e instala Haylou S40 (solo para el usuario actual, sin admin).
+# Empaqueta Haylou S40 con PyInstaller y, salvo -NoInstall, lo instala solo para el
+# usuario actual (sin admin). La misma receta la usan los workflows de GitHub.
+#
+#   build.ps1                                  # empaqueta e instala
+#   build.ps1 -NoInstall -DistDir dist -Zip    # solo genera dist\Haylou S40 y el .zip (CI)
+#
+# Firma opcional: si hay certificado (parametros o variables SIGN_CERT_PFX_BASE64 /
+# SIGN_CERT_PASSWORD), se firma el .exe con signtool antes de instalar o comprimir.
+param(
+    [switch]$NoInstall,
+    [string]$DistDir,
+    [switch]$Zip,
+    [string]$Python = 'py',
+    [string]$CertPath,
+    [string]$CertPassword = $env:SIGN_CERT_PASSWORD
+)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
-if (-not (Test-Path "$here\icon.ico")) { Push-Location $here; py make_icon.py; Pop-Location }
+$app = 'Haylou S40'
+if (-not (Test-Path "$here\icon.ico")) {
+    Push-Location $here
+    & $Python make_icon.py
+    if ($LASTEXITCODE) { throw "No se pudo generar icon.ico" }
+    Pop-Location
+}
 $work = Join-Path $env:TEMP 'haylou_s40_build'
-$dist = Join-Path $work 'dist'
+if (-not $DistDir) { $DistDir = Join-Path $work 'dist' }
+$DistDir = [IO.Path]::GetFullPath($(if ([IO.Path]::IsPathRooted($DistDir)) { $DistDir } else { Join-Path $here $DistDir }))
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $work | Out-Null
 
-py -m PyInstaller --noconfirm --clean --onedir --windowed --name "Haylou S40" `
-  --workpath "$work\b" --specpath $work --distpath $dist `
+& $Python -m PyInstaller --noconfirm --clean --onedir --windowed --name $app `
+  --workpath "$work\b" --specpath $work --distpath $DistDir `
   --icon "$here\icon.ico" --add-data "$here\icon.ico;." `
   --add-data "$here\tcl_stub;_tcl_data" --add-data "$here\tcl_stub;_tk_data" --runtime-hook "$here\rthook_tcl9.py" `
   --paths $here --collect-submodules bleak --collect-all winrt `
   --hidden-import pystray._win32 `
   --exclude-module flet --exclude-module numpy --exclude-module pycaw `
   "$here\haylou_s40.py"
-if (-not (Test-Path "$dist\Haylou S40\Haylou S40.exe")) { throw "Fallo el empaquetado" }
+$built = Join-Path $DistDir $app
+if (-not (Test-Path "$built\$app.exe")) { throw "Fallo el empaquetado" }
 
+# --- firma (opcional) ---
+$tmpCert = $null
+if (-not $CertPath -and $env:SIGN_CERT_PFX_BASE64) {
+    $tmpCert = Join-Path $work 'cert.pfx'
+    [IO.File]::WriteAllBytes($tmpCert, [Convert]::FromBase64String($env:SIGN_CERT_PFX_BASE64))
+    $CertPath = $tmpCert
+}
+if ($CertPath) {
+    $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending | Select-Object -First 1
+    if (-not $signtool) { throw "No se encontro signtool.exe (Windows SDK)" }
+    try {
+        & $signtool.FullName sign /f $CertPath /p $CertPassword /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 /d $app "$built\$app.exe"
+        if ($LASTEXITCODE) { throw "Fallo la firma del ejecutable" }
+        Write-Host "Ejecutable firmado" -ForegroundColor Green
+    } finally {
+        if ($tmpCert) { Remove-Item $tmpCert -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+if ($Zip) {
+    $zipPath = Join-Path (Split-Path $DistDir) 'Haylou-S40-Windows.zip'
+    Remove-Item $zipPath -ErrorAction SilentlyContinue
+    Compress-Archive -Path $built -DestinationPath $zipPath
+    Write-Host "Generado $zipPath" -ForegroundColor Green
+}
+if ($NoInstall) { return }
+
+# --- instalacion para el usuario actual ---
 $target = Join-Path $env:LOCALAPPDATA 'Programs\HaylouS40'
-Get-Process 'Haylou S40' -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process $app -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 1
 Remove-Item -Recurse -Force $target -ErrorAction SilentlyContinue
-Copy-Item "$dist\Haylou S40" $target -Recurse
-$exe = Join-Path $target 'Haylou S40.exe'
+Copy-Item $built $target -Recurse
+$exe = Join-Path $target "$app.exe"
 
 $lnkDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
 $ws = New-Object -ComObject WScript.Shell
-$l = $ws.CreateShortcut((Join-Path $lnkDir 'Haylou S40.lnk'))
+$l = $ws.CreateShortcut((Join-Path $lnkDir "$app.lnk"))
 $l.TargetPath = $exe; $l.WorkingDirectory = $target; $l.IconLocation = "$exe,0"; $l.Save()
 
 # Desinstalador
@@ -41,10 +94,9 @@ Start-Process powershell -WindowStyle Hidden -ArgumentList "-NoProfile -Command 
 "@ | Set-Content $un -Encoding UTF8
 $k = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\HaylouS40'
 New-Item $k -Force | Out-Null
-Set-ItemProperty $k DisplayName 'Haylou S40'
+Set-ItemProperty $k DisplayName $app
 Set-ItemProperty $k DisplayIcon $exe
 Set-ItemProperty $k Publisher 'Local'
 Set-ItemProperty $k InstallLocation $target
 Set-ItemProperty $k UninstallString "powershell -NoProfile -ExecutionPolicy Bypass -File `"$un`""
 Write-Host "Instalado en $target" -ForegroundColor Green
-

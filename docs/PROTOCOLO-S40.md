@@ -45,6 +45,10 @@ El cuerpo de la respuesta (desde el byte 9) es una lista TLV: `<largo> <ordinal>
 | `0x13` | `0x0b` | Escenario espacial | `0` Música · `1` Ejercicio · `2` Película |
 | `0x14` | `0x0c` | Reducción de ruido de viento | `0` / `1` |
 
+### Avisos espontáneos (op `0x0e`)
+
+Al pulsar el botón físico, el auricular manda sin que se lo pidan `aabbcc c0 0e 0004 <sn> 02 08 <modo> ddeeff`: el cuerpo es TLV como el del estado completo, con el campo `0x08` = modo de ruido (mismos valores que la tabla). La app lo aplica al instante y después pide el estado completo para confirmarlo.
+
 Cómo se verificó cada modo de ruido: con el botón físico el auricular manda `aabbccc00e00040a0208<modo>ddeeff` (Off, Ambiente, ANC, en ese orden de pulsación); el adaptativo no se activa desde el botón, pero se vio que la app oficial escribe el valor `4`. El valor `3` se acepta pero no hace nada audible.
 
 ## Probado sin efecto en el S40

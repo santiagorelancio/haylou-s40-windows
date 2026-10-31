@@ -26,6 +26,12 @@ check("tlv con 02 en la dirección", p.parse_run_info(ADDR02), {p.ORD_ANC: p.ANC
 # Trama que no encaja como TLV: respaldo con la búsqueda de tripletas
 check("respaldo sin tlv", p.parse_run_info(bytes.fromhex("aabbcc000900050009ff020901ddeeff")), {p.ORD_ANC: 1})
 check("ack no es run info", p.parse_run_info(ACK), {})
+# Botón físico: aviso espontáneo con el modo nuevo (Off, Ambiente, ANC)
+for modo in (p.ANC_NORMAL, p.ANC_TRANSP, p.ANC_ANC):
+    ev = bytes.fromhex(f"aabbccc00e00040a0208{modo:02x}ddeeff")
+    check(f"aviso botón modo {modo}", p.parse_event(ev), {p.EVT_ANC: modo})
+check("run info no es aviso", p.parse_event(FULL), {})
+check("aviso no es run info", p.parse_run_info(bytes.fromhex("aabbccc00e00040a020801ddeeff")), {})
 check("set anc=1", p.build_set(p.ATTR_ANC, 1).hex(), "aabbcc8008000401020401ddeeff")
 check("get battery", p.build_get_battery().hex(), "aabbccc00200050200000004ddeeff")
 check("get all", p.build_get_all().hex(), "aabbccc009000509ffffffffddeeff")
